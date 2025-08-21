@@ -1,1 +1,0 @@
-This is the repository for the SPEECH EMOTION RECORDATION USING CAPSULE NETWORKS replication experiment

@@ -16,79 +16,174 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
-    print("警告: matplotlib未安装，将跳过训练曲线绘制")
+    print("Warning: matplotlib not installed, skipping training curve plotting")
 from collections import defaultdict
 
-from model.CNN_GRU_SeqCap import CNN_SeqCap
+from model.CNN_GRU_SeqCap import CNN_GRU_SeqCap
+
+def xavier_init_weights(model):
+    """Apply Xavier initialization to CNN and Capsule layers"""
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+class EarlyStopping:
+    """Early stopping mechanism"""
+    
+    def __init__(self, patience=7, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.early_stop = False
+        
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            
+        if self.counter >= self.patience:
+            self.early_stop = True
+            
+        return self.early_stop
 
 class DynamicLearningRateScheduler:
-    """基于训练损失的动态学习率调度器"""
+    """Dynamic learning rate scheduler based on recent 100 training steps average loss"""
     
-    def __init__(self, optimizer, initial_lr=0.001, window_size=100):
+    def __init__(self, optimizer, initial_lr=0.001):
         self.optimizer = optimizer
         self.initial_lr = initial_lr
-        self.window_size = window_size
-        self.loss_history = []
-        self.lr_schedule = [0.001, 0.0005, 0.0002, 0.0001]
-        self.current_lr_index = 0
-        self.last_avg_loss = float('inf')
+        self.current_lr = initial_lr
+        self.train_losses = []  # Store recent training losses
+        self.window_size = 100  # Window size for averaging
+        self.epoch_count = 0
+        self.lr_stages = [0.001, 0.0005, 0.0002, 0.0001]  # Learning rate stages
+        self.current_stage = 0
+        self.previous_avg_loss = float('inf')
         
-    def step(self, loss):
-        """更新学习率"""
-        self.loss_history.append(loss)
-        
-        # 只有当损失历史达到窗口大小时才开始调整
-        if len(self.loss_history) >= self.window_size:
-            # 计算最近100步的平均损失
-            recent_losses = self.loss_history[-self.window_size:]
-            current_avg_loss = sum(recent_losses) / len(recent_losses)
+    def add_train_loss(self, loss):
+        """Add training loss to the window"""
+        self.train_losses.append(loss)
+        if len(self.train_losses) > self.window_size:
+            self.train_losses.pop(0)  # Keep only recent losses
             
-            # 检查是否需要降低学习率（损失下降10倍）
-            if self.last_avg_loss / current_avg_loss >= 10.0 and self.current_lr_index < len(self.lr_schedule) - 1:
-                self.current_lr_index += 1
-                new_lr = self.lr_schedule[self.current_lr_index]
-                
-                # 更新优化器的学习率
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                
-                print(f"\n🔄 学习率调整: {self.get_current_lr():.6f} -> {new_lr:.6f}")
-                print(f"   触发条件: 平均损失从 {self.last_avg_loss:.6f} 降至 {current_avg_loss:.6f}")
-                
-                self.last_avg_loss = current_avg_loss
-            elif len(self.loss_history) == self.window_size:
-                # 第一次计算平均损失
-                self.last_avg_loss = current_avg_loss
+    def step_epoch(self):
+        """Called at the end of each epoch"""
+        self.epoch_count += 1
+        
+        # For first 3 epochs, keep initial learning rate
+        if self.epoch_count <= 3:
+            return
+            
+        # Check if we have enough losses to calculate average
+        if len(self.train_losses) >= self.window_size:
+            current_avg_loss = sum(self.train_losses) / len(self.train_losses)
+            
+            # Check if average loss decreased by 10x
+            if self.previous_avg_loss != float('inf') and current_avg_loss <= self.previous_avg_loss / 10:
+                if self.current_stage < len(self.lr_stages) - 1:
+                    self.current_stage += 1
+                    new_lr = self.lr_stages[self.current_stage]
+                    self.current_lr = new_lr
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    print(f"\n🔄 Learning rate reduced to {new_lr:.6f} (avg loss decreased 10x: {self.previous_avg_loss:.6f} -> {current_avg_loss:.6f})")
+                    
+            self.previous_avg_loss = current_avg_loss
     
     def get_current_lr(self):
-        """获取当前学习率"""
+        """Get current learning rate"""
         return self.optimizer.param_groups[0]['lr']
     
     def get_lr_info(self):
-        """获取学习率调度信息"""
+        """Get learning rate scheduling information"""
+        avg_loss = sum(self.train_losses) / len(self.train_losses) if self.train_losses else 0
         return {
             'current_lr': self.get_current_lr(),
-            'lr_index': self.current_lr_index,
-            'loss_history_length': len(self.loss_history),
-            'last_avg_loss': self.last_avg_loss
+            'epoch_count': self.epoch_count,
+            'current_stage': self.current_stage,
+            'avg_train_loss': avg_loss,
+            'window_size': len(self.train_losses)
         }
 
+class DataAugmentation:
+    """Data augmentation class"""
+    
+    def __init__(self, noise_factor=0.01, time_mask_param=10, freq_mask_param=5):
+        self.noise_factor = noise_factor
+        self.time_mask_param = time_mask_param
+        self.freq_mask_param = freq_mask_param
+    
+    def add_noise(self, spec):
+        """Add Gaussian noise"""
+        noise = torch.randn_like(spec) * self.noise_factor
+        return spec + noise
+    
+    def time_mask(self, spec):
+        """Time masking"""
+        if len(spec.shape) == 3:
+            _, freq_bins, time_steps = spec.shape
+            mask_size = np.random.randint(0, min(self.time_mask_param, time_steps))
+            mask_start = np.random.randint(0, time_steps - mask_size + 1)
+            spec_masked = spec.clone()
+            spec_masked[:, :, mask_start:mask_start + mask_size] = 0
+        else:
+            _, _, freq_bins, time_steps = spec.shape
+            mask_size = np.random.randint(0, min(self.time_mask_param, time_steps))
+            mask_start = np.random.randint(0, time_steps - mask_size + 1)
+            spec_masked = spec.clone()
+            spec_masked[:, :, :, mask_start:mask_start + mask_size] = 0
+        return spec_masked
+    
+    def freq_mask(self, spec):
+        """Frequency masking"""
+        if len(spec.shape) == 3:
+            _, freq_bins, time_steps = spec.shape
+            mask_size = np.random.randint(0, min(self.freq_mask_param, freq_bins))
+            mask_start = np.random.randint(0, freq_bins - mask_size + 1)
+            spec_masked = spec.clone()
+            spec_masked[:, mask_start:mask_start + mask_size, :] = 0
+        else:
+            _, _, freq_bins, time_steps = spec.shape
+            mask_size = np.random.randint(0, min(self.freq_mask_param, freq_bins))
+            mask_start = np.random.randint(0, freq_bins - mask_size + 1)
+            spec_masked = spec.clone()
+            spec_masked[:, :, mask_start:mask_start + mask_size, :] = 0
+        return spec_masked
+    
+    def __call__(self, spec):
+        """Randomly apply data augmentation"""
+        if np.random.random() < 0.5:
+            spec = self.add_noise(spec)
+        if np.random.random() < 0.3:
+            spec = self.time_mask(spec)
+        if np.random.random() < 0.3:
+            spec = self.freq_mask(spec)
+        return spec
+
 class IEMOCAPDataset(Dataset):
-    """IEMOCAP数据集加载器"""
+    """IEMOCAP dataset loader"""
     def __init__(self, data_dict, transform=None):
         """
         Args:
-            data_dict: 包含seg_spec, seg_label等的字典
-            transform: 数据变换函数
+            data_dict: Dictionary containing seg_spec, seg_label, etc.
+            transform: Data transformation function
         """
         self.seg_spec = data_dict['seg_spec']  # (N, 1, 200, 300)
         self.seg_label = data_dict['seg_label']  # (N,)
         self.transform = transform
         
-        # 数据预处理：调整维度以匹配模型输入 [batch, 1, freq, time]
-        # 原始数据是 (N, 1, 200, 300)，需要转换为 (N, 1, 200, 300)
-        # 模型期望输入是 [batch, 1, freq_bins, time_steps]
-        print(f"原始数据形状: {self.seg_spec.shape}")
+        # Data preprocessing: adjust dimensions to match model input [batch, 1, freq, time]
+        # Original data is (N, 1, 200, 300), needs to be converted to (N, 1, 200, 300)
+        # Model expects input as [batch, 1, freq_bins, time_steps]
+        print(f"Original data shape: {self.seg_spec.shape}")
         
     def __len__(self):
         return len(self.seg_spec)
@@ -97,7 +192,7 @@ class IEMOCAPDataset(Dataset):
         spec = self.seg_spec[idx]  # (1, 200, 300)
         label = self.seg_label[idx]
         
-        # 转换为torch tensor
+        # Convert to torch tensor
         spec = torch.FloatTensor(spec)
         label = torch.LongTensor([label])[0]
         
@@ -106,161 +201,135 @@ class IEMOCAPDataset(Dataset):
             
         return spec, label
 
-def load_data_by_session(data_path):
-    """按Session加载IEMOCAP数据，保持Session结构"""
-    print(f"正在加载数据: {data_path}")
+def load_data_by_speaker(data_path):
+    """Load IEMOCAP data by speaker for leave-one-speaker-out cross-validation"""
+    print(f"Loading data: {data_path}")
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
     
-    session_data = {}
+    speaker_data = {}
     total_samples = 0
     
-    # 检查数据格式并处理
+    # Check data format and process
     if isinstance(list(data.values())[0], dict) and 'features' in list(list(data.values())[0].values())[0]:
-        # 测试数据格式：Session1 -> {Session1_M: {features: [], labels: []}, Session1_F: {...}}
+        # Test data format: Session1 -> {Session1_M: {features: [], labels: []}, Session1_F: {...}}
         for session_key in sorted(data.keys()):
             session_info = data[session_key]
             
-            # 合并该Session下所有说话人的数据
-            all_features = []
-            all_labels = []
-            
             for speaker_key in session_info.keys():
-                speaker_data = session_info[speaker_key]
-                all_features.extend(speaker_data['features'])
-                all_labels.extend(speaker_data['labels'])
-            
-            # 转换为numpy数组
-            session_data[session_key] = {
-                'seg_spec': np.array(all_features),
-                'seg_label': np.array(all_labels)
-            }
-            
-            num_samples = len(all_features)
-            total_samples += num_samples
-            print(f"Session {session_key}: {num_samples} 个样本")
+                speaker_data_info = session_info[speaker_key]
+                
+                # Convert to numpy arrays
+                speaker_data[speaker_key] = {
+                    'seg_spec': np.array(speaker_data_info['features']),
+                    'seg_label': np.array(speaker_data_info['labels'])
+                }
+                
+                num_samples = len(speaker_data_info['features'])
+                total_samples += num_samples
+                print(f"Speaker {speaker_key}: {num_samples} samples")
     else:
-        # 真实IEMOCAP数据格式：1F, 1M, 2F, 2M, ...
-        # 需要将同一Session的不同说话人数据合并
-        session_groups = {}
-        
-        for session_key in sorted(data.keys()):
-            # 提取Session编号（如"1F" -> "Session1", "2M" -> "Session2"）
-            session_num = session_key[0]  # 取第一个字符作为session编号
-            session_id = f"Session{session_num}"
+        # Real IEMOCAP data format: 1F, 1M, 2F, 2M, ...
+        # Keep data separated by speaker for leave-one-speaker-out
+        for speaker_key in sorted(data.keys()):
+            speaker_info = data[speaker_key]
             
-            if session_id not in session_groups:
-                session_groups[session_id] = []
-            session_groups[session_id].append(session_key)
-            
-            num_samples = data[session_key]['seg_spec'].shape[0]
-            total_samples += num_samples
-            print(f"{session_key}: {num_samples} 个样本")
-        
-        # 合并同一Session的数据
-        for session_id, session_keys in session_groups.items():
-            all_features = []
-            all_labels = []
-            
-            for session_key in session_keys:
-                session_info = data[session_key]
-                all_features.append(session_info['seg_spec'])
-                all_labels.append(session_info['seg_label'])
-            
-            # 合并数据
-            session_data[session_id] = {
-                'seg_spec': np.concatenate(all_features, axis=0),
-                'seg_label': np.concatenate(all_labels, axis=0)
+            speaker_data[speaker_key] = {
+                'seg_spec': speaker_info['seg_spec'],
+                'seg_label': speaker_info['seg_label']
             }
+            
+            num_samples = speaker_info['seg_spec'].shape[0]
+            total_samples += num_samples
+            print(f"Speaker {speaker_key}: {num_samples} samples")
     
-    print(f"总样本数: {total_samples}")
-    print(f"合并后的Session数: {len(session_data)}")
-    for session_id in sorted(session_data.keys()):
-        print(f"{session_id}: {session_data[session_id]['seg_spec'].shape[0]} 个样本")
+    print(f"Total samples: {total_samples}")
+    print(f"Number of speakers: {len(speaker_data)}")
     
-    return session_data
+    return speaker_data
 
-def create_five_fold_splits(session_data):
-    """创建五折交叉验证的数据划分
+def create_ten_fold_speaker_splits(speaker_data):
+    """Create 10-fold leave-one-speaker-out cross-validation data splits
     
     Args:
-        session_data: 按Session组织的数据字典
+        speaker_data: Data dictionary organized by speaker
         
     Returns:
-        List of 5 folds, each containing (train_data, val_data, test_data)
+        List of 10 folds, each containing (train_data, val_data, test_data)
     """
-    sessions = list(session_data.keys())
-    if len(sessions) != 5:
-        raise ValueError(f"IEMOCAP应该有5个Session，但找到了{len(sessions)}个")
+    speakers = list(speaker_data.keys())
+    if len(speakers) != 10:
+        raise ValueError(f"IEMOCAP should have 10 speakers, but found {len(speakers)}")
     
     folds = []
     
-    for i, test_session in enumerate(sessions):
-        print(f"\n=== 创建第{i+1}折交叉验证 ===")
-        print(f"测试Session: {test_session}")
+    for i, test_speaker in enumerate(speakers):
+        print(f"\n=== Creating fold {i+1} cross-validation (Leave-One-Speaker-Out) ===")
+        print(f"Test speaker: {test_speaker}")
         
-        # 训练集：其他4个Session的数据
-        train_sessions = [s for s in sessions if s != test_session]
-        print(f"训练Sessions: {train_sessions}")
+        # Get remaining 9 speakers for training and validation
+        remaining_speakers = [s for s in speakers if s != test_speaker]
         
-        # 合并训练数据
+        # Use 8 speakers for training and 1 speaker for validation
+        # Choose validation speaker as the next speaker in the list (circular)
+        val_speaker = remaining_speakers[i % len(remaining_speakers)]
+        train_speakers = [s for s in remaining_speakers if s != val_speaker]
+        
+        print(f"Training speakers: {train_speakers}")
+        print(f"Validation speaker: {val_speaker}")
+        
+        # Merge training data from 8 speakers
         train_specs = []
         train_labels = []
-        for session in train_sessions:
-            train_specs.append(session_data[session]['seg_spec'])
-            train_labels.append(session_data[session]['seg_label'])
+        for speaker in train_speakers:
+            train_specs.append(speaker_data[speaker]['seg_spec'])
+            train_labels.append(speaker_data[speaker]['seg_label'])
         
         train_data = {
             'seg_spec': np.concatenate(train_specs, axis=0),
             'seg_label': np.concatenate(train_labels, axis=0)
         }
         
-        # 测试Session的数据需要分为验证集和测试集
-        test_session_spec = session_data[test_session]['seg_spec']
-        test_session_label = session_data[test_session]['seg_label']
-        
-        # 按说话人划分验证集和测试集（假设前一半是一个说话人，后一半是另一个说话人）
-        n_samples = len(test_session_spec)
-        mid_point = n_samples // 2
-        
+        # Validation data from 1 speaker
         val_data = {
-            'seg_spec': test_session_spec[:mid_point],
-            'seg_label': test_session_label[:mid_point]
+            'seg_spec': speaker_data[val_speaker]['seg_spec'],
+            'seg_label': speaker_data[val_speaker]['seg_label']
         }
         
+        # Test data from the left-out speaker
         test_data = {
-            'seg_spec': test_session_spec[mid_point:],
-            'seg_label': test_session_label[mid_point:]
+            'seg_spec': speaker_data[test_speaker]['seg_spec'],
+            'seg_label': speaker_data[test_speaker]['seg_label']
         }
         
-        print(f"训练集: {len(train_data['seg_spec'])} 样本")
-        print(f"验证集: {len(val_data['seg_spec'])} 样本")
-        print(f"测试集: {len(test_data['seg_spec'])} 样本")
+        print(f"Training set: {len(train_data['seg_spec'])} samples")
+        print(f"Validation set: {len(val_data['seg_spec'])} samples")
+        print(f"Test set: {len(test_data['seg_spec'])} samples")
         
         folds.append((train_data, val_data, test_data))
     
     return folds
 
 def normalize_data(train_data, val_data, test_data):
-    """对数据进行标准化处理（零均值单位方差归一化）
+    """Normalize data (zero mean unit variance normalization)
     
     Args:
-        train_data, val_data, test_data: 数据字典
+        train_data, val_data, test_data: Data dictionaries
         
     Returns:
-        标准化后的数据和标准化参数
+        Normalized data and normalization parameters
     """
-    # 计算训练集的均值和标准差
+    # Calculate mean and standard deviation of training set
     train_spec = train_data['seg_spec']
-    mean = np.mean(train_spec, axis=(0, 2, 3), keepdims=True)  # 保持维度用于广播
+    mean = np.mean(train_spec, axis=(0, 2, 3), keepdims=True)  # Keep dimensions for broadcasting
     std = np.std(train_spec, axis=(0, 2, 3), keepdims=True)
     
-    # 避免除零
+    # Avoid division by zero
     std = np.where(std == 0, 1, std)
     
-    print(f"数据标准化参数: mean={mean.flatten()}, std={std.flatten()}")
+    print(f"Data normalization parameters: mean={mean.flatten()}, std={std.flatten()}")
     
-    # 标准化所有数据集
+    # Normalize all datasets
     normalized_train = {
         'seg_spec': (train_data['seg_spec'] - mean) / std,
         'seg_label': train_data['seg_label'].copy()
@@ -281,7 +350,7 @@ def normalize_data(train_data, val_data, test_data):
     return normalized_train, normalized_val, normalized_test, normalization_params
 
 def split_data(data_dict, train_ratio=0.8, val_ratio=0.1, random_seed=42):
-    """划分训练、验证、测试集"""
+    """Split training, validation, and test sets"""
     np.random.seed(random_seed)
     
     total_samples = len(data_dict['seg_spec'])
@@ -304,21 +373,21 @@ def split_data(data_dict, train_ratio=0.8, val_ratio=0.1, random_seed=42):
     val_data = create_subset(val_indices)
     test_data = create_subset(test_indices)
     
-    print(f"数据划分: 训练集={len(train_indices)}, 验证集={len(val_indices)}, 测试集={len(test_indices)}")
+    print(f"Data split: training={len(train_indices)}, validation={len(val_indices)}, test={len(test_indices)}")
     
     return train_data, val_data, test_data
 
 def calculate_metrics(y_true, y_pred, num_classes=4):
-    """计算评估指标"""
+    """Calculate evaluation metrics"""
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     
-    # 计算混淆矩阵
+    # Calculate confusion matrix
     cm = np.zeros((num_classes, num_classes), dtype=int)
     for i in range(len(y_true)):
         cm[y_true[i], y_pred[i]] += 1
     
-    # 未加权准确率 (UA) - 每个类别准确率的平均
+    # Unweighted accuracy (UA) - average of per-class accuracies
     class_accuracies = []
     for i in range(num_classes):
         if cm[i].sum() > 0:
@@ -329,53 +398,53 @@ def calculate_metrics(y_true, y_pred, num_classes=4):
     
     ua = np.mean(class_accuracies)
     
-    # 加权准确率 (WA) - 总体准确率
+    # Weighted accuracy (WA) - overall accuracy
     wa = np.sum(y_true == y_pred) / len(y_true)
     
     return {
         'UA': ua,
         'WA': wa,
         'class_accuracies': class_accuracies,
-        'confusion_matrix': cm.tolist()  # 转换为list以便JSON序列化
+        'confusion_matrix': cm.tolist()  # Convert to list for JSON serialization
     }
 
 def train_epoch(model, dataloader, criterion, optimizer, device, lr_scheduler=None):
-    """训练一个epoch"""
+    """Train one epoch"""
     model.train()
     total_loss = 0.0
     all_preds = []
     all_labels = []
     
-    # 创建进度条
-    pbar = tqdm(dataloader, desc="训练中", file=sys.stdout)
+    # Create progress bar
+    pbar = tqdm(dataloader, desc="Training", file=sys.stdout)
     
     for batch_idx, (data, target) in enumerate(pbar):
-        data, target = data.to(device), target.to(device)
+        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        # 前向传播
+        # Forward pass
         output = model(data)
         loss = criterion(output, target)
         
-        # 反向传播
+        # Backward pass
         loss.backward()
         optimizer.step()
         
-        # 更新学习率调度器
-        if lr_scheduler is not None:
-            lr_scheduler.step(loss.item())
-        
         total_loss += loss.item()
         
-        # 预测结果
+        # Add loss to learning rate scheduler
+        if lr_scheduler is not None:
+            lr_scheduler.add_train_loss(loss.item())
+        
+        # Prediction results
         pred = output.argmax(dim=1)
         all_preds.extend(pred.cpu().numpy())
         all_labels.extend(target.cpu().numpy())
         
-        # 更新进度条显示
+        # Update progress bar display
         current_avg_loss = total_loss / (batch_idx + 1)
-        current_lr = lr_scheduler.get_current_lr() if lr_scheduler else optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[0]['lr']
         pbar.set_postfix({
             'Loss': f'{loss.item():.6f}',
             'Avg_Loss': f'{current_avg_loss:.6f}',
@@ -388,18 +457,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, lr_scheduler=No
     return avg_loss, metrics
 
 def evaluate(model, dataloader, criterion, device):
-    """评估模型"""
+    """Evaluate model"""
     model.eval()
     total_loss = 0.0
     all_preds = []
     all_labels = []
     
-    # 创建进度条
-    pbar = tqdm(dataloader, desc="验证中", file=sys.stdout)
+    # Create progress bar
+    pbar = tqdm(dataloader, desc="Validating", file=sys.stdout)
     
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(pbar):
-            data, target = data.to(device), target.to(device)
+            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
             
             output = model(data)
             loss = criterion(output, target)
@@ -410,7 +479,7 @@ def evaluate(model, dataloader, criterion, device):
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(target.cpu().numpy())
             
-            # 更新进度条显示
+            # Update progress bar display
             current_avg_loss = total_loss / (batch_idx + 1)
             pbar.set_postfix({
                 'Loss': f'{loss.item():.6f}',
@@ -423,55 +492,55 @@ def evaluate(model, dataloader, criterion, device):
     return avg_loss, metrics
 
 def save_experiment_log(log_data, save_dir):
-    """保存实验日志"""
+    """Save experiment log"""
     os.makedirs(save_dir, exist_ok=True)
     
-    # 保存JSON格式的日志
+    # Save log in JSON format
     log_file = os.path.join(save_dir, 'experiment_log.json')
     with open(log_file, 'w', encoding='utf-8') as f:
         json.dump(log_data, f, indent=2, ensure_ascii=False)
     
-    print(f"实验日志已保存到: {log_file}")
+    print(f"Experiment log saved to: {log_file}")
 
 def plot_training_curves(train_losses, val_losses, train_metrics, val_metrics, save_dir):
-    """绘制训练曲线"""
+    """Plot training curves"""
     if not MATPLOTLIB_AVAILABLE:
-        print("跳过训练曲线绘制 (matplotlib未安装)")
+        print("Skipping training curve plotting (matplotlib not installed)")
         return
         
     epochs = range(1, len(train_losses) + 1)
     
-    # 损失曲线
+    # Loss curves
     plt.figure(figsize=(15, 5))
     
     plt.subplot(1, 3, 1)
-    plt.plot(epochs, train_losses, 'b-', label='训练损失')
-    plt.plot(epochs, val_losses, 'r-', label='验证损失')
-    plt.title('训练和验证损失')
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
+    plt.title('Training and Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
     
-    # UA曲线
+    # UA curves
     plt.subplot(1, 3, 2)
     train_ua = [m['UA'] for m in train_metrics]
     val_ua = [m['UA'] for m in val_metrics]
-    plt.plot(epochs, train_ua, 'b-', label='训练UA')
-    plt.plot(epochs, val_ua, 'r-', label='验证UA')
-    plt.title('未加权准确率 (UA)')
+    plt.plot(epochs, train_ua, 'b-', label='Training UA')
+    plt.plot(epochs, val_ua, 'r-', label='Validation UA')
+    plt.title('Unweighted Accuracy (UA)')
     plt.xlabel('Epoch')
     plt.ylabel('UA')
     plt.legend()
     plt.grid(True)
     
-    # WA曲线
+    # WA curves
     plt.subplot(1, 3, 3)
     train_wa = [m['WA'] for m in train_metrics]
     val_wa = [m['WA'] for m in val_metrics]
-    plt.plot(epochs, train_wa, 'b-', label='训练WA')
-    plt.plot(epochs, val_wa, 'r-', label='验证WA')
-    plt.title('加权准确率 (WA)')
+    plt.plot(epochs, train_wa, 'b-', label='Training WA')
+    plt.plot(epochs, val_wa, 'r-', label='Validation WA')
+    plt.title('Weighted Accuracy (WA)')
     plt.xlabel('Epoch')
     plt.ylabel('WA')
     plt.legend()
@@ -481,76 +550,115 @@ def plot_training_curves(train_losses, val_losses, train_metrics, val_metrics, s
     plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"训练曲线已保存到: {os.path.join(save_dir, 'training_curves.png')}")
+    print(f"Training curves saved to: {os.path.join(save_dir, 'training_curves.png')}")
 
 def train_single_fold(fold_idx, train_data, val_data, test_data, config, experiment_dir):
-    """训练单个折"""
+    """Train single fold"""
     print(f"\n{'='*80}")
-    print(f"🔄 开始第 {fold_idx + 1} 折训练")
+    print(f"🔄 Starting fold {fold_idx + 1} training")
     print(f"{'='*80}")
     
-    # 强制使用CPU以避免CUDA兼容性问题
-    device = torch.device('cpu')
+    # Automatically select device: prioritize GPU, use CPU if unavailable
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🖥️  Using device: {device}")
     
-    # 数据标准化
+    # Data normalization
     train_data, val_data, test_data, normalization_params = normalize_data(train_data, val_data, test_data)
     
-    # 创建数据加载器
-    train_dataset = IEMOCAPDataset(train_data)
+    # Create data augmentation
+    train_augmentation = DataAugmentation(noise_factor=0.01, time_mask_param=10, freq_mask_param=5)
+    
+    # Create data loaders (use data augmentation only for training set)
+    train_dataset = IEMOCAPDataset(train_data, transform=train_augmentation)
     val_dataset = IEMOCAPDataset(val_data)
     test_dataset = IEMOCAPDataset(test_data)
     
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
+    # Set num_workers: use multi-threading for GPU training, single-threading for CPU training
+    num_workers = 4 if device.type == 'cuda' else 0
+    pin_memory = True if device.type == 'cuda' else False
     
-    print(f"📊 数据统计:")
-    print(f"   训练集: {len(train_dataset)} 样本")
-    print(f"   验证集: {len(val_dataset)} 样本")
-    print(f"   测试集: {len(test_dataset)} 样本")
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, 
+                             num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, 
+                           num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, 
+                            num_workers=num_workers, pin_memory=pin_memory)
     
-    # 创建模型
-    model = CNN_SeqCap(num_classes=config['num_classes']).to(device)
+    print(f"📊 Data Statistics:")
+    print(f"   Training set: {len(train_dataset)} samples")
+    print(f"   Validation set: {len(val_dataset)} samples")
+    print(f"   Test set: {len(test_dataset)} samples")
     
-    # 定义损失函数和优化器（按照规范配置）
+    # GPU memory management
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        print(f"🔧 GPU cache cleared")
+    
+    # Create model (CNN-GRU-SeqCap architecture aligned with Wu et al. paper)
+    model = CNN_GRU_SeqCap(
+        num_classes=config['num_classes'],
+        window_size=config.get('window_size', 40),  # Wu et al. paper: 40 input steps
+        window_stride=config.get('window_stride', 20),  # Wu et al. paper: 20 step stride
+        gru_hidden_size=config.get('gru_hidden_size', 128),  # GRU hidden dimension
+        gru_num_layers=config.get('gru_num_layers', 2),  # Number of GRU layers
+        dropout_rate=config.get('dropout_rate', 0.5)  # Dropout rate
+    ).to(device)
+    
+    # Apply Xavier initialization
+    xavier_init_weights(model)
+    print(f"✅ Applied Xavier initialization to CNN and Capsule layers")
+    
+    # Define loss function and optimizer (according to user specifications)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], 
-                          betas=(0.9, 0.999), eps=1e-8)
+                          betas=(0.9, 0.999), eps=1e-8)  # β1=0.9, β2=0.999, ε=1e-8
     
-    # 创建动态学习率调度器
+    # Create dynamic learning rate scheduler (based on recent 100 training steps)
     lr_scheduler = DynamicLearningRateScheduler(optimizer, initial_lr=config['learning_rate'])
     
-    # 训练记录
+    # Create early stopping mechanism
+    early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+    
+    # Training records
     train_losses = []
     val_losses = []
     train_metrics = []
     val_metrics = []
-    best_val_wa = 0.0  # 使用WA作为模型选择标准
+    best_val_wa = 0.0  # Use WA as model selection criterion
     best_model_state = None
     
-    print(f"\n🚀 开始训练 (共 {config['epochs']} 个epoch)")
+    print(f"\n🚀 Starting training ({config['epochs']} epochs total)")
     start_time = time.time()
     
-    # 创建epoch级别的进度条
+    # Create epoch-level progress bar
     epoch_pbar = tqdm(range(config['epochs']), desc=f"Fold {fold_idx + 1}", position=0, leave=True)
     
     for epoch in epoch_pbar:
         epoch_start_time = time.time()
         
-        # 训练
+        # Training
         train_loss, train_metric = train_epoch(model, train_loader, criterion, optimizer, device, lr_scheduler)
         train_losses.append(train_loss)
         train_metrics.append(train_metric)
         
-        # 验证
+        # Validation
         val_loss, val_metric = evaluate(model, val_loader, criterion, device)
         val_losses.append(val_loss)
         val_metrics.append(val_metric)
         
-        # 计算epoch耗时
+        # Update learning rate scheduler (based on recent training losses)
+        lr_scheduler.step_epoch()
+        
+        # Check early stopping
+        if early_stopping(val_loss):
+            print(f"\n⏹️  Early stopping triggered! Stopped training at epoch {epoch+1}")
+            print(f"   Validation loss has not improved for {early_stopping.patience} consecutive epochs")
+            break
+        
+        # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
         
-        # 保存最佳模型（基于验证集WA）
+        # Save best model (based on validation WA)
         if val_metric['WA'] > best_val_wa:
             best_val_wa = val_metric['WA']
             best_model_state = {
@@ -562,7 +670,7 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
                 'fold': fold_idx
             }
         
-        # 更新进度条
+        # Update progress bar
         lr_info = lr_scheduler.get_lr_info()
         epoch_pbar.set_postfix({
             'T_Loss': f'{train_loss:.4f}',
@@ -571,30 +679,34 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
             'LR': f'{lr_info["current_lr"]:.6f}'
         })
         
-        # 每5个epoch打印详细信息
+        # Print detailed information every 5 epochs
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"\n📊 Epoch {epoch+1}/{config['epochs']} 结果:")
-            print(f"   训练: Loss={train_loss:.6f}, UA={train_metric['UA']:.4f}, WA={train_metric['WA']:.4f}")
-            print(f"   验证: Loss={val_loss:.6f}, UA={val_metric['UA']:.4f}, WA={val_metric['WA']:.4f}")
-            print(f"   学习率: {lr_info['current_lr']:.6f}, 耗时: {epoch_time:.2f}s")
+            print(f"\n📊 Epoch {epoch+1}/{config['epochs']} Results:")
+            print(f"   Training: Loss={train_loss:.6f}, UA={train_metric['UA']:.4f}, WA={train_metric['WA']:.4f}")
+            print(f"   Validation: Loss={val_loss:.6f}, UA={val_metric['UA']:.4f}, WA={val_metric['WA']:.4f}")
+            print(f"   Learning rate: {lr_info['current_lr']:.6f}, Time: {epoch_time:.2f}s")
     
     epoch_pbar.close()
     
-    # 加载最佳模型进行测试
+    # Load best model for testing
     if best_model_state is not None:
         model.load_state_dict(best_model_state['model_state_dict'])
     
-    # 测试集评估
+    # Test set evaluation
     test_loss, test_metric = evaluate(model, test_loader, criterion, device)
     
     training_time = time.time() - start_time
     
-    print(f"\n✅ 第 {fold_idx + 1} 折训练完成")
-    print(f"   训练时间: {training_time:.2f}秒")
-    print(f"   最佳验证WA: {best_val_wa:.4f}")
-    print(f"   测试结果: UA={test_metric['UA']:.4f}, WA={test_metric['WA']:.4f}")
+    # GPU memory cleanup
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     
-    # 保存折的结果
+    print(f"\n✅ Fold {fold_idx + 1} training completed")
+    print(f"   Training time: {training_time:.2f} seconds")
+    print(f"   Best validation WA: {best_val_wa:.4f}")
+    print(f"   Test results: UA={test_metric['UA']:.4f}, WA={test_metric['WA']:.4f}")
+    
+    # Save fold results
     fold_results = {
         'fold_idx': fold_idx,
         'training_time': training_time,
@@ -615,7 +727,7 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
         }
     }
     
-    # 保存折的模型和结果
+    # Save fold model and results
     fold_dir = os.path.join(experiment_dir, f'fold_{fold_idx + 1}')
     os.makedirs(fold_dir, exist_ok=True)
     
@@ -625,40 +737,66 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
     with open(os.path.join(fold_dir, 'results.json'), 'w', encoding='utf-8') as f:
         json.dump(fold_results, f, indent=2, ensure_ascii=False)
     
-    # 绘制训练曲线
+    # Plot training curves
     plot_training_curves(train_losses, val_losses, train_metrics, val_metrics, fold_dir)
     
     return fold_results
 
 def main():
-    parser = argparse.ArgumentParser(description='CNN-GRU-SeqCap五折交叉验证训练脚本')
+    parser = argparse.ArgumentParser(description='CNN-GRU-SeqCap Ten-Fold Leave-One-Speaker-Out Cross-Validation Training Script')
     parser.add_argument('--data_path', type=str, default='data/IEMOCAP_multi.pkl',
-                        help='数据文件路径')
+                        help='Data file path')
     parser.add_argument('--batch_size', type=int, default=16,
-                        help='批量大小（固定为16）')
+                        help='Batch size (default: 16)')
     parser.add_argument('--epochs', type=int, default=20,
-                        help='训练轮数（固定为20）')
+                        help='Number of training epochs (default: 20)')
     parser.add_argument('--lr', type=float, default=0.001,
-                        help='初始学习率（固定为0.001）')
+                        help='Initial learning rate (default: 0.001)')
     parser.add_argument('--num_classes', type=int, default=4,
-                        help='分类数量')
+                        help='Number of classes (default: 4)')
     parser.add_argument('--save_dir', type=str, default='experiments',
-                        help='实验结果保存目录')
+                        help='Experiment results save directory')
+    parser.add_argument('--cpu_only', action='store_true',
+                        help='Force CPU training (even if GPU is available)')
+    
+    # CNN-GRU-SeqCap model parameters (aligned with Wu et al. paper)
+    parser.add_argument('--window_size', type=int, default=40,
+                        help='Window size for temporal segmentation (Wu et al. paper: 40)')
+    parser.add_argument('--window_stride', type=int, default=20,
+                        help='Window stride for temporal segmentation (Wu et al. paper: 20)')
+    parser.add_argument('--gru_hidden_size', type=int, default=128,
+                        help='GRU hidden dimension (default: 128)')
+    parser.add_argument('--gru_num_layers', type=int, default=2,
+                        help='Number of GRU layers (default: 2)')
+    parser.add_argument('--dropout_rate', type=float, default=0.5,
+                        help='Dropout rate (default: 0.5)')
     
     args = parser.parse_args()
     
-    # 强制使用CPU以避免CUDA兼容性问题
-    device = torch.device('cpu')
-    print(f"🖥️  使用设备: {device}")
-    if torch.cuda.is_available():
-        print("⚠️  注意: 检测到CUDA但由于兼容性问题使用CPU运行")
+    # Select device based on parameters and availability
+    if args.cpu_only:
+        device = torch.device('cpu')
+        print(f"🖥️  Using device: {device} (user specified)")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"🖥️  Using device: {device}")
+        
+    if torch.cuda.is_available() and device.type == 'cuda':
+        print(f"✅ CUDA detected, using GPU accelerated training")
+        print(f"   GPU device count: {torch.cuda.device_count()}")
+        print(f"   Current GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    elif torch.cuda.is_available() and device.type == 'cpu':
+        print("⚠️  CUDA detected but user chose to run on CPU")
+    else:
+        print("⚠️  CUDA not detected, running on CPU")
     
-    # 创建实验目录
+    # Create experiment directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = os.path.join(args.save_dir, f"five_fold_cv_{timestamp}")
+    experiment_dir = os.path.join(args.save_dir, f"ten_fold_loso_cv_{timestamp}")
     os.makedirs(experiment_dir, exist_ok=True)
     
-    # 保存超参数配置
+    # Save hyperparameter configuration
     config = {
         'batch_size': args.batch_size,
         'epochs': args.epochs,
@@ -667,46 +805,54 @@ def main():
         'device': str(device),
         'data_path': args.data_path,
         'timestamp': timestamp,
-        'experiment_type': 'five_fold_cross_validation',
+        'experiment_type': 'ten_fold_leave_one_speaker_out_cross_validation',
         'optimizer': 'Adam(β1=0.9, β2=0.999, ε=1e-8)',
-        'initialization': 'Xavier',
-        'lr_schedule': 'Dynamic(window=100, ratios=[0.001, 0.0005, 0.0002, 0.0001])',
-        'model_selection': 'Best validation WA'
+        'initialization': 'Xavier (CNN and Capsule layers)',
+        'lr_schedule': 'Dynamic (first 3 epochs: 0.001, then 0.0005→0.0002→0.0001 based on 100-step avg loss)',
+        'early_stopping': 'patience=7, min_delta=0.001',
+        'regularization': 'Cross-entropy loss',
+        'model_selection': 'Best validation WA (Weighted Accuracy)',
+        'validation_strategy': '10-fold leave-one-speaker-out cross-validation',
+        # CNN-GRU-SeqCap model parameters (aligned with Wu et al. paper)
+        'window_size': 40,  # Wu et al. paper: 40 input steps
+        'window_stride': 20,  # Wu et al. paper: 20 step stride
+        'gru_hidden_size': 128,  # GRU hidden dimension
+        'gru_num_layers': 2,  # Number of GRU layers
+        'dropout_rate': 0.5,  # Dropout rate
+        'model_architecture': 'CNN-GRU-SeqCap (dual-branch with CNN backbone + GRU temporal modeling)'
     }
     
-    print("\n📋 五折交叉验证配置")
+    print("\n📋 Ten-Fold Leave-One-Speaker-Out Cross-Validation Configuration")
     print("="*50)
     for key, value in config.items():
         print(f"{key}: {value}")
     
-    # 加载数据并创建五折划分
-    print("\n📂 数据加载与划分")
+    # Load data and create ten-fold speaker splits
+    print("\n📂 Data Loading and Splitting")
     print("="*50)
-    session_data = load_data_by_session(args.data_path)
-    fold_splits = create_five_fold_splits(session_data)
+    speaker_data = load_data_by_speaker(args.data_path)
+    fold_splits = create_ten_fold_speaker_splits(speaker_data)
     
-    print(f"✅ 成功创建 {len(fold_splits)} 折数据划分")
-    for i, (train_sessions, val_session, test_session) in enumerate(fold_splits):
-        print(f"   Fold {i+1}: 训练={train_sessions}, 验证={val_session}, 测试={test_session}")
+    print(f"✅ Successfully created {len(fold_splits)} fold data splits")
     
-    # 执行五折交叉验证
+    # Execute ten-fold leave-one-speaker-out cross-validation
     all_fold_results = []
     total_start_time = time.time()
     
-    print("\n🚀 开始五折交叉验证")
+    print("\n🚀 Starting Ten-Fold Leave-One-Speaker-Out Cross-Validation")
     print("="*80)
     
     for fold_idx, (train_data, val_data, test_data) in enumerate(fold_splits):
-        # 数据已经在create_five_fold_splits中准备好了
+        # Data is already prepared in create_five_fold_splits
         
-        # 训练当前折
+        # Train current fold
         fold_result = train_single_fold(fold_idx, train_data, val_data, test_data, config, experiment_dir)
         all_fold_results.append(fold_result)
     
     total_time = time.time() - total_start_time
     
-    # 计算五折交叉验证的总体结果
-    print("\n📊 五折交叉验证总体结果")
+    # Calculate overall results of ten-fold cross-validation
+    print("\n📊 Ten-Fold Leave-One-Speaker-Out Cross-Validation Overall Results")
     print("="*80)
     
     test_uas = [result['test_results']['UA'] for result in all_fold_results]
@@ -720,18 +866,18 @@ def main():
     mean_val_wa = np.mean(val_was)
     std_val_wa = np.std(val_was)
     
-    print(f"🎯 测试集 UA: {mean_test_ua:.4f} ± {std_test_ua:.4f}")
-    print(f"🎯 测试集 WA: {mean_test_wa:.4f} ± {std_test_wa:.4f}")
-    print(f"🎯 验证集 WA: {mean_val_wa:.4f} ± {std_val_wa:.4f}")
-    print(f"⏱️  总训练时间: {total_time:.2f}秒")
+    print(f"🎯 Test UA: {mean_test_ua:.4f} ± {std_test_ua:.4f}")
+    print(f"🎯 Test WA: {mean_test_wa:.4f} ± {std_test_wa:.4f}")
+    print(f"🎯 Validation WA: {mean_val_wa:.4f} ± {std_val_wa:.4f}")
+    print(f"⏱️  Total training time: {total_time:.2f} seconds")
     
-    print("\n📋 各折详细结果:")
+    print("\n📋 Detailed results for each fold:")
     for i, result in enumerate(all_fold_results):
-        print(f"   Fold {i+1}: 测试UA={result['test_results']['UA']:.4f}, "
-              f"测试WA={result['test_results']['WA']:.4f}, "
-              f"验证WA={result['best_val_wa']:.4f}")
+        print(f"   Fold {i+1}: Test UA={result['test_results']['UA']:.4f}, "
+              f"Test WA={result['test_results']['WA']:.4f}, "
+              f"Val WA={result['best_val_wa']:.4f}")
     
-    # 保存总体实验结果
+    # Save overall experiment results
     final_results = {
         'config': config,
         'total_time': total_time,
@@ -749,8 +895,8 @@ def main():
     with open(os.path.join(experiment_dir, 'final_results.json'), 'w', encoding='utf-8') as f:
         json.dump(final_results, f, indent=2, ensure_ascii=False)
     
-    print(f"\n💾 实验结果已保存到: {experiment_dir}")
-    print(f"🏆 最终结果: 测试UA={mean_test_ua:.4f}±{std_test_ua:.4f}, 测试WA={mean_test_wa:.4f}±{std_test_wa:.4f}")
+    print(f"\n💾 Experiment results saved to: {experiment_dir}")
+    print(f"🏆 Final results: Test UA={mean_test_ua:.4f}±{std_test_ua:.4f}, Test WA={mean_test_wa:.4f}±{std_test_wa:.4f}")
 
 if __name__ == "__main__":
     main()
