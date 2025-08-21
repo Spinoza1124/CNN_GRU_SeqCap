@@ -1,0 +1,33 @@
+dataset: 'IEMOCAP'
+
+dataset_dir: 'E:\\code\\Trae\\CNN_GRU_SeqCap\\data\\IEMOCAP'
+
+features: 'logspec'
+
+window: 'hamming'
+
+win_length: 40
+
+hop_length: 10
+
+# DFT size. Default: 800
+ndft: 800
+
+# Number of lowest DFT points to be used as features. Default: 200
+nfreq: 200
+
+# Number of mel frequency bands used as features. Default: 128
+nmel: 128
+
+# Size of each features segment
+segment_size: 300
+
+# Set this flag to mix with noise.
+mixnoise: True
+
+save_dir: "E:\\code\\Trae\\CNN_GRU_SeqCap\\data"
+
+save_label: 'multi345'
+
+
+
