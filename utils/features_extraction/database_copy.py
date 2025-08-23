@@ -15,7 +15,7 @@ IEMOCAP_EMO_CODES = {'neu': ['neu', 'neutral'],
 
 
 
-class IEMOCAP_database():
+class IEMOCAP():
     """
     IEMOCAP database contains data from 10 actors, 5 male and 5 female,
     during their affective dyadic interaction. The database consists of
@@ -52,14 +52,14 @@ class IEMOCAP_database():
         https://sail.usc.edu/iemocap/iemocap_release.htm
     """
 
-    def __init__(self, database_dir, emotion_map = {'ang': 0, 'sad':1, 'hap':2, 'neu':3},
+    def __init__(self, database_dir, emot_map = {'ang': 0, 'sad':1, 'hap':2, 'neu':3},
                         include_scripted=False): 
         
         #Path
         self.database_dir = database_dir
 
         #Emotion to label mapping for features
-        self.emotion_map = emotion_map
+        self.emot_map = emot_map
 
         #IEMOCAP Session name
         self.sessions = ['Session1','Session2','Session3','Session4','Session5']
@@ -78,7 +78,7 @@ class IEMOCAP_database():
     def get_classes(self):
 
         classes={}
-        for key,value in self.emotion_map.items():
+        for key,value in self.emot_map.items():
             if value in classes.keys():
                 classes[value] += '+'+key
             else:
@@ -93,7 +93,7 @@ class IEMOCAP_database():
                 keys   -> speaker ID
                 values -> list of (.wav filepath, label) tuples for corresponding speaker
         """
-        emotions = self.emotion_map.keys()
+        emotions = self.emot_map.keys()
         dataset_dir = self.database_dir
         all_speaker_files = defaultdict()
         total_num_files = 0
@@ -146,7 +146,7 @@ class IEMOCAP_database():
                     emotion = labels[name]
                     if emotion not in emotions:
                         continue
-                    label = self.emotion_map[emotion]
+                    label = self.emot_map[emotion]
                     
                     wav_files.append((os.path.join(conversation_dir, wav_name), label))
                 
@@ -166,3 +166,13 @@ class IEMOCAP_database():
     
 SER_DATABASES = {'IEMOCAP': IEMOCAP_database}
     
+if __name__ == "__main__":
+    database_dir = "data/IEMOCAP"
+
+    emotion_map = {'ang':0, 'sad':1, 'hap':2, 'neu':3, 'exc':2}
+    iemocap = IEMOCAP(database_dir=database_dir, emot_map=emotion_map, include_scripted=True)
+    
+    speaker_file = iemocap.get_files()
+    
+    print(speaker_file)
+                              

@@ -1,303 +1,217 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
 
 def squash(vectors, dim=-1):
     """
-    Squash non-linear activation function for capsule networks
-    :param vectors: Input tensor, e.g., [batch_size, num_caps, caps_dim]
-    :param dim: Dimension to compute on
-    :return: Tensor after squash operation
+    非线性激活函数，将向量的模长压缩到0-1之间，同时保持方向不变。
     """
     squared_norm = (vectors ** 2).sum(dim=dim, keepdim=True)
     scale = squared_norm / (1 + squared_norm)
-    return scale * vectors / (torch.sqrt(squared_norm) + 1e-8)  # 1e-8 to prevent division by zero
+    # 加上一个很小的 epsilon 防止除以零
+    return scale * vectors / (torch.sqrt(squared_norm) + 1e-8)
 
 class CapsuleLayer(nn.Module):
     """
-    Capsule layer with dynamic routing algorithm
-    Based on "Dynamic Routing Between Capsules" by Sabour et al.
+    实现动态路由的胶囊层。
     """
     def __init__(self, in_caps, out_caps, in_dim, out_dim, routing_iters=3):
-        """
-        :param in_caps: Number of input capsules
-        :param out_caps: Number of output capsules
-        :param in_dim: Dimension of input capsules
-        :param out_dim: Dimension of output capsules
-        :param routing_iters: Number of routing iterations
-        """
         super(CapsuleLayer, self).__init__()
         self.in_caps = in_caps
         self.out_caps = out_caps
-        self.in_dim = in_dim
-        self.out_dim = out_dim
         self.routing_iters = routing_iters
-
-        # Weight matrix W_ij for transforming input capsules to prediction vectors
-        # Shape: [in_caps, out_caps, out_dim, in_dim]
+        
         self.W = nn.Parameter(torch.randn(in_caps, out_caps, out_dim, in_dim))
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights using Xavier uniform initialization"""
-        nn.init.xavier_uniform_(self.W)
 
     def forward(self, u):
-        """
-        Forward pass with dynamic routing algorithm
-        :param u: Input capsules, shape [batch_size, in_caps, in_dim]
-        :return: Output capsules, shape [batch_size, out_caps, out_dim]
-        """
         batch_size = u.size(0)
-
-        # Step 1: Compute prediction vectors û_j|i = W_ij * u_i
-        # Expand u dimensions for matrix multiplication with W
-        # u_expanded shape: [batch_size, in_caps, 1, 1, in_dim]
-        u_expanded = u.unsqueeze(2).unsqueeze(3)
-        u_expanded = u_expanded.transpose(-2, -1)
-
-        # Tile W for batch processing
-        # W_tiled shape: [batch_size, in_caps, out_caps, out_dim, in_dim]
+        u_expanded = u.unsqueeze(2).unsqueeze(-1)
         W_tiled = self.W.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
-
-        # Compute prediction vectors through matrix multiplication
-        # u_hat shape: [batch_size, in_caps, out_caps, out_dim]
         u_hat = torch.matmul(W_tiled, u_expanded).squeeze(-1)
 
-        # Step 2: Dynamic routing algorithm
-        # Initialize routing logits b_ij to zero
         b = torch.zeros(batch_size, self.in_caps, self.out_caps, device=u.device)
 
-        for iteration in range(self.routing_iters):
-            # Compute coupling coefficients c_ij = softmax(b_ij)
-            # Apply softmax over out_caps dimension
+        for i in range(self.routing_iters):
             c = F.softmax(b, dim=2)
-
-            # Compute weighted sum s_j = Σ_i c_ij * û_j|i
-            # Expand c dimensions to match u_hat for element-wise multiplication
-            # c shape: [batch, in_caps, out_caps, 1], u_hat shape: [batch, in_caps, out_caps, out_dim]
             s = (c.unsqueeze(-1) * u_hat).sum(dim=1)
-
-            # Apply squash activation function v_j = squash(s_j)
             v = squash(s)
-
-            # Update routing logits (except for last iteration)
-            if iteration < self.routing_iters - 1:
-                # Compute agreement û_j|i · v_j
-                # agreement shape: [batch_size, in_caps, out_caps]
-                agreement = (u_hat * v.unsqueeze(1)).sum(dim=-1)
-                b = b + agreement
-
+            agreement = (u_hat * v.unsqueeze(1)).sum(dim=-1)
+            b = b + agreement
+        
         return v
 
-class CNN_GRU_SeqCap(nn.Module):
+class CapsuleBranch(nn.Module):
     """
-    CNN-GRU-SeqCap model based on Wu et al. "Speech Emotion Recognition Using Capsule Networks"
-    Implements both CNN and GRU branches with sequential capsule networks
+    专门为CNN-GRU-SeqCap设计的胶囊分支，接收来自CNN主干的特征图。
     """
-    def __init__(self, num_classes=4, input_dim=128, max_seq_len=200, 
-                 window_size=40, window_stride=20, dropout=0.2):
-        super(CNN_GRU_SeqCap, self).__init__()
-        self.num_classes = num_classes
-        self.input_dim = input_dim
-        self.max_seq_len = max_seq_len
-        self.window_size = window_size
-        self.window_stride = window_stride
-        self.dropout = dropout
-        
-        # CNN Branch - Based on Sabour et al. configuration
-        self.cnn_backbone = nn.Sequential(
-            # First conv layer: 256 filters, 9x9, stride 1
-            nn.Conv2d(1, 256, kernel_size=9, stride=1, padding=4),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            
-            # Additional conv layers for better feature extraction
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        
-        # Primary Capsules - Based on Sabour et al.: 32 8-dimensional capsules, 9x9, stride 2
-        self.primary_caps_conv = nn.Conv2d(256, 32 * 8, kernel_size=9, stride=2, padding=0)
-        self.primary_caps_dim = 8
-        self.num_primary_caps_per_location = 32
-        
-        # GRU Branch for temporal modeling
-        self.gru_hidden_dim = 128
-        self.gru = nn.GRU(
-            input_size=input_dim,
-            hidden_size=self.gru_hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=True
-        )
-        
-        # Feature fusion layer
-        self.fusion_dim = 256
-        self.feature_fusion = nn.Linear(self.gru_hidden_dim * 2, self.fusion_dim)
-        
-        # Dynamic capsule layers (initialized in forward)
-        self.window_emo_caps = None
-        self.utterance_caps = None
-        
-        # Calculate max number of windows based on paper parameters
-        self.max_windows = max(1, (max_seq_len - window_size) // window_stride + 1)
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize model weights using Xavier/Glorot initialization"""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.GRU):
-                for name, param in m.named_parameters():
-                    if 'weight_ih' in name:
-                        nn.init.xavier_uniform_(param.data)
-                    elif 'weight_hh' in name:
-                        nn.init.orthogonal_(param.data)
-                    elif 'bias' in name:
-                        nn.init.constant_(param.data, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+    def __init__(self, cnn_output_channels, cnn_output_height, cnn_output_width, num_classes=4):
+        super(CapsuleBranch, self).__init__()
 
+        # 将CNN特征图 [C, H] 转换为初级胶囊
+        # 例如，每个时间步的 [16, 8] 特征图可以看作 16 个 8D 胶囊
+        self.primary_caps_dim = cnn_output_height
+        self.num_primary_caps = cnn_output_channels
+
+        # 动态路由层，聚合时间序列上的所有初级胶囊
+        self.digit_caps = CapsuleLayer(
+            in_caps=cnn_output_width,  # 输入胶囊数 = 时间步数
+            out_caps=num_classes,
+            in_dim=self.num_primary_caps * self.primary_caps_dim, # 将 C 和 H 展平作为输入维度
+            out_dim=16 # 最终的输出胶囊维度
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features=16, out_features=num_classes)
+        )
+        
     def forward(self, x):
-        """
-        Forward pass implementing CNN-GRU-SeqCap architecture
-        :param x: Input spectrogram, shape [batch_size, 1, freq_bins, time_steps]
-        :return: Class probabilities, shape [batch_size, num_classes]
-        """
-        B, C, H, T = x.shape
+        # x 是来自CNN的特征图, 尺寸: [Batch, Channels, Height, Width/Time]
+        B, C, H, W = x.shape
+
+        # 1. 重塑为初级胶囊序列
+        # 将 C 和 H 展平，并将 W 作为序列长度
+        # 尺寸变为: [B, W, C*H]
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.view(B, W, C * H)
         
-        # Branch 1: CNN Feature Extraction
-        cnn_features = self.cnn_backbone(x)  # [B, 256, H', T']
+        # 为了与CapsuleLayer的输入匹配 [B, in_caps, in_dim], in_caps是序列长度
+        # 这里需要将 x 的维度调整为 [B, W, C*H] -> [B, 序列长度, 特征维度]
+        # x 已经是正确的形状了
         
-        # Primary Capsules
-        primary_caps_output = self.primary_caps_conv(cnn_features)
-        # primary_caps_output shape: [B, 32*8, H'', T'']
+        # 2. 动态路由
+        # 注意：这里我们将整个时间序列的特征作为一个大的向量输入给每个时间步的胶囊
+        # 这是一个简化的实现，更复杂的会保持胶囊的结构
+        # 为了更符合胶囊思想，我们将 C*H 维度视为初级胶囊
+        # [B, W, C*H] -> [B, W, 16*8]
+        # 让我们把C看作胶囊数，H看作胶囊维度
+        x = x.view(B, W, self.num_primary_caps * self.primary_caps_dim) # [B, 50, 128]
         
-        B, caps_channels, H_prime, T_prime = primary_caps_output.shape
-        
-        # Reshape to capsule format: [B, num_caps, caps_dim]
-        primary_caps = primary_caps_output.view(
-            B, self.num_primary_caps_per_location, self.primary_caps_dim, H_prime, T_prime
-        )
-        primary_caps = primary_caps.permute(0, 3, 4, 1, 2).contiguous()  # [B, H', T', 32, 8]
-        primary_caps = primary_caps.view(
-            B, H_prime * T_prime * self.num_primary_caps_per_location, self.primary_caps_dim
-        )
-        
-        # Branch 2: GRU Temporal Modeling
-        # Reshape input for GRU: [B, T, H]
-        gru_input = x.squeeze(1).transpose(1, 2)  # [B, T, H]
-        gru_output, _ = self.gru(gru_input)  # [B, T, hidden_dim*2]
-        gru_features = self.feature_fusion(gru_output)  # [B, T, fusion_dim]
-        
-        # Windowing Process (based on paper: window_size=40, stride=20)
-        caps_per_time_step = H_prime * self.num_primary_caps_per_location
-        primary_caps_seq = primary_caps.view(B, T_prime, caps_per_time_step * self.primary_caps_dim)
-        
-        # Apply windowing with paper's parameters
-        if T_prime < self.window_size:
-            # Handle short sequences
-            windows = primary_caps_seq.unsqueeze(1)
-            num_windows = 1
-            actual_window_size = T_prime
-        else:
-            # Apply unfold for windowing
-            windows = primary_caps_seq.unfold(
-                dimension=1, size=self.window_size, step=self.window_stride
-            )
-            num_windows = windows.size(1)
-            windows = windows.transpose(-2, -1)
-            actual_window_size = self.window_size
-        
-        # Reshape windows for capsule processing
-        windows_flat = windows.contiguous().view(B, num_windows, -1)
-        in_caps_per_window = actual_window_size * caps_per_time_step
-        
-        # Dynamic initialization of window emotion capsules
-        if self.window_emo_caps is None:
-            self.window_emo_caps = CapsuleLayer(
-                in_caps=in_caps_per_window,
-                out_caps=self.num_classes,
-                in_dim=self.primary_caps_dim,
-                out_dim=16,
-                routing_iters=3
-            ).to(x.device)
-        
-        # Process windows through emotion capsules
-        window_caps_in = windows_flat.view(B, num_windows, in_caps_per_window, self.primary_caps_dim)
-        window_caps_in_reshaped = window_caps_in.view(B * num_windows, in_caps_per_window, self.primary_caps_dim)
-        
-        # Apply Window Emotion Capsules
-        window_caps_out = self.window_emo_caps(window_caps_in_reshaped)
-        window_caps_out = window_caps_out.view(B, num_windows, self.num_classes, 16)
-        
-        # Aggregate emotion capsules (average across classes)
-        utterance_caps_in = window_caps_out.mean(dim=2)  # [B, num_windows, 16]
-        
-        # Dynamic initialization of utterance capsules
-        if self.utterance_caps is None:
-            self.utterance_caps = CapsuleLayer(
-                in_caps=min(num_windows, self.max_windows),
-                out_caps=self.num_classes,
-                in_dim=16,
-                out_dim=16,
-                routing_iters=3
-            ).to(x.device)
-        
-        # Handle variable sequence lengths
-        if num_windows < self.utterance_caps.in_caps:
-            pad_size = self.utterance_caps.in_caps - num_windows
-            padding = torch.zeros(B, pad_size, 16, device=x.device)
-            utterance_caps_in = torch.cat([utterance_caps_in, padding], dim=1)
-        elif num_windows > self.utterance_caps.in_caps:
-            utterance_caps_in = utterance_caps_in[:, :self.utterance_caps.in_caps, :]
-        
-        # Apply Utterance Capsules
-        final_caps = self.utterance_caps(utterance_caps_in)
-        
-        # Compute final output (capsule lengths as class probabilities)
-        lengths = torch.sqrt((final_caps ** 2).sum(dim=-1) + 1e-8)  # [B, num_classes]
+        # 路由层期望输入 [B, in_caps, in_dim], in_caps 是序列长度
+        caps_output = self.digit_caps(x) # [B, num_classes, 16]
+
+        # 3. 计算输出概率
+        # 使用模长作为存在的概率
+        lengths = torch.sqrt((caps_output ** 2).sum(dim=-1)) # [B, num_classes]
         
         return lengths
 
 
-# === Usage Example ===
-if __name__ == '__main__':
-    # Example: batch_size=16, spectrogram size 1x128x200 (channels x frequency x time)
-    dummy_input = torch.randn(16, 1, 128, 200)
+class BiGRUBranch(nn.Module):
+    """
+    实现图中所示的 BiGRU -> Classifier 分支。
+    """
+    def __init__(self, cnn_output_channels, cnn_output_height, num_classes=4, gru_hidden_size=64, dropout_rate=0.5):
+        super(BiGRUBranch, self).__init__()
+        gru_input_size = cnn_output_channels * cnn_output_height
+        self.bigru = nn.GRU(
+            input_size=gru_input_size,
+            hidden_size=gru_hidden_size,
+            num_layers=1,
+            bidirectional=True,
+            batch_first=True
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features=gru_hidden_size * 2, out_features=64),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(in_features=64, out_features=num_classes)
+        )
 
-    # Create model with CNN-GRU-SeqCap architecture
-    model = CNN_GRU_SeqCap(
-        num_classes=4,
-        input_dim=128,
-        max_seq_len=200,
-        window_size=40,
-        window_stride=20,
-        dropout=0.2
-    )
-    
-    # Forward pass
-    try:
-        output = model(dummy_input)
-        print("Model output shape:", output.shape)  # Should be [16, 4]
-        print("Output probabilities:", torch.softmax(output, dim=-1))
-    except Exception as e:
-        print("Model execution error (likely dimension mismatch):", e)
-        print("This is expected - capsule network dimensions need precise design.")
-        print("Please adjust CapsuleLayer parameters based on your CNN output dimensions.")
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(0, 3, 1, 2).contiguous().view(B, W, C * H)
+        _, h_n = self.bigru(x)
+        gru_output_combined = torch.cat((h_n[0, :, :], h_n[1, :, :]), dim=1)
+        logits = self.classifier(gru_output_combined)
+        probabilities = F.softmax(logits, dim=1)
+        return probabilities
+
+class CNN_GRU_SeqCap(nn.Module):
+    """
+    论文 "Speech Emotion Recognition Using Capsule Networks" 提出的最终模型
+    """
+    def __init__(self, num_classes=4, lambda_val=0.6):
+        super(CNN_GRU_SeqCap, self).__init__()
+        self.lambda_val = lambda_val
+
+        # --- 1. 共享的CNN主干 ---
+        self.conv1a = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=(2, 8), padding='same')
+        self.conv1b = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=(8, 2), padding='same')
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 1))
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels=16, out_channels=16, kernel_size=5, padding='same'),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_channels=16, out_channels=16, kernel_size=5, padding='same'),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.MaxPool2d(kernel_size=(4,1))
+        )
+
+        # --- 2. 定义两个并行的分支 ---
+        # 经过CNN主干后，我们预期的特征图尺寸为 [B, 16, 8, 50] (C=16, H=8, W=50)
+        # 这个尺寸是基于一个典型的输入尺寸计算得出的，如果输入尺寸变化，这里也需要调整
+        cnn_output_channels = 16
+        cnn_output_height = 4
+        cnn_output_width = 50 # 假设时间维度是50
+
+        # 实例化胶囊分支
+        self.capsule_branch = CapsuleBranch(
+            cnn_output_channels=cnn_output_channels,
+            cnn_output_height=cnn_output_height,
+            cnn_output_width=cnn_output_width,
+            num_classes=num_classes
+        )
+
+        # 实例化GRU分支
+        self.gru_branch = BiGRUBranch(
+            cnn_output_channels=cnn_output_channels,
+            cnn_output_height=cnn_output_height,
+            num_classes=num_classes
+        )
+
+    def forward(self, x):
+        # --- 1. 通过共享的CNN主干 ---
+        x_a = self.conv1a(x)
+        x_b = self.conv1b(x)
+        x_concat = torch.cat((x_a, x_b), dim=1)
+        
+        # 注意：论文图示和描述有些许模糊，这里我们采用最合理的结构
+        # Concat -> Pool1 -> Conv2 -> Conv3
+        x_pooled = self.pool1(x_concat)
+        x_conv2_out = self.conv2(x_pooled)
+        cnn_features = self.conv3(x_conv2_out) # [B, C, H, W]
+
+        # --- 2. 将特征图送入两个分支 ---
+        # 胶囊分支输出
+        caps_output_probs = self.capsule_branch(cnn_features)
+
+        # GRU分支输出
+        gru_output_probs = self.gru_branch(cnn_features)
+
+        # --- 3. 融合两个分支的输出 ---
+        # 根据论文，在测试阶段，使用加权求和
+        final_probs = self.lambda_val * caps_output_probs + (1 - self.lambda_val) * gru_output_probs
+        
+        return final_probs
+
+
+# # --- 如何使用 ---
+# if __name__ == '__main__':
+#     # 假设输入语谱图尺寸：batch=16, 通道=1, 频率=128, 时间=200
+#     dummy_input = torch.randn(16, 1, 128, 200)
+
+#     # 实例化最终模型
+#     model = CNN_GRU_SeqCap(num_classes=4)
+
+#     # 前向传播
+#     final_output = model(dummy_input)
+
+#     # 打印输出尺寸
+#     print("输入尺寸:", dummy_input.shape)
+#     print("最终模型输出尺寸:", final_output.shape) # 应该是 [16, 4]
+#     print("第一个样本的输出概率:", final_output[0])
+#     print("概率和 (应该约等于1):", torch.sum(final_output[0]))

@@ -1,355 +1,572 @@
-import numpy as np
-import librosa
-import librosa.display
-import matplotlib.pyplot as plt
+"""
+Audio Feature Extraction Utilities for Speech Emotion Recognition
+
+This module provides functions for extracting various audio features including
+log spectrograms, mel spectrograms, and delta features from audio signals.
+"""
+
 import math
 import os
 from collections import defaultdict
+from typing import Dict, List, Tuple, Union, Optional
+
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
 from tqdm import tqdm
-from pysndfx import  AudioEffectsChain
-import random
-from transformers import BertTokenizer, BertModel, Wav2Vec2ForCTC, Wav2Vec2CTCTokenizer, Wav2Vec2Processor, AutoTokenizer
+from transformers import Wav2Vec2Processor
 
-             
-def extract_features(speaker_files, features, params):
+# Constants
+DEFAULT_WAV2VEC_MODEL = "facebook/wav2vec2-base-960h"
+DEFAULT_HOP_LENGTH = 160
+DEFAULT_MFCC_FEATURES = 40
+DEFAULT_SAMPLING_RATE = 16000
+SEGMENT_SIZE_MULTIPLIER = 160
+
+# Global processor instance to avoid repeated initialization
+_wav2vec_processor = None
+
+
+def get_wav2vec_processor(model_path: Optional[str] = None) -> Wav2Vec2Processor:
+    """
+    Get or initialize Wav2Vec2 processor.
     
-    processor = Wav2Vec2Processor.from_pretrained("E:\\code\\Trae\\CNN_GRU_SeqCap\\pretrain_model\\wav2vec2-base-960h")
-    speaker_features = defaultdict()
-    
-    for speaker_id in tqdm(speaker_files.keys()):
+    Args:
+        model_path: Path to the Wav2Vec2 model. If None, uses default model.
         
-        data_tot, labels_tot, labels_segs_tot, segs, data_mfcc, data_audio = list(), list(), list(), list(), list(), list()
-        for wav_path, emotion in speaker_files[speaker_id]:
+    Returns:
+        Wav2Vec2Processor instance
+    """
+    global _wav2vec_processor
+    if _wav2vec_processor is None:
+        model_name = model_path or DEFAULT_WAV2VEC_MODEL
+        try:
+            _wav2vec_processor = Wav2Vec2Processor.from_pretrained(model_name)
+        except Exception as e:
+            print(f"Warning: Failed to load Wav2Vec2 model {model_name}: {e}")
+            _wav2vec_processor = None
+    return _wav2vec_processor
+
+
+def validate_audio_file(wav_path: str) -> bool:
+    """
+    Validate if audio file exists and is not empty.
+    
+    Args:
+        wav_path: Path to the audio file
+        
+    Returns:
+        True if file is valid, False otherwise
+    """
+    # Normalize path to handle double slashes
+    wav_path = os.path.normpath(wav_path)
+    
+    if not os.path.exists(wav_path):
+        print(f"Warning: File not found: {wav_path}")
+        return False
+        
+    if os.path.getsize(wav_path) == 0:
+        print(f"Warning: Empty file: {wav_path}")
+        return False
+        
+    return True
+
+
+def load_and_preprocess_audio(wav_path: str, 
+                             apply_preemphasis: bool = True) -> Tuple[Optional[np.ndarray], Optional[int]]:
+    """
+    Load and preprocess audio file.
+    
+    Args:
+        wav_path: Path to the audio file
+        apply_preemphasis: Whether to apply pre-emphasis filter
+        
+    Returns:
+        Tuple of (audio_data, sample_rate) or (None, None) if failed
+    """
+    try:
+        audio_data, sample_rate = librosa.load(wav_path, sr=None)
+        
+        if len(audio_data) == 0:
+            print(f"Warning: Empty audio data: {wav_path}")
+            return None, None
             
-            # 修复路径中的双斜杠问题
-            wav_path = os.path.normpath(wav_path)
+        if apply_preemphasis:
+            audio_data = librosa.effects.preemphasis(audio_data, zi=[0.0])
             
-            # 检查文件是否存在
-            if not os.path.exists(wav_path):
-                print(f"Warning: File not found: {wav_path}")
-                continue
-                
-            # 检查文件大小
-            if os.path.getsize(wav_path) == 0:
-                print(f"Warning: Empty file: {wav_path}")
-                continue
-            
-            try:
-                # Read wave data
-                x, sr = librosa.load(wav_path, sr=None)
-                
-                # 检查加载的音频是否为空
-                if len(x) == 0:
-                    print(f"Warning: Empty audio data: {wav_path}")
-                    continue
+        return audio_data, sample_rate
+        
+    except Exception as e:
+        print(f"Error loading audio file {wav_path}: {str(e)}")
+        return None, None
 
-                # Apply pre-emphasis filter
-                x = librosa.effects.preemphasis(x, zi = [0.0])
 
-                # Extract required features into (C,F,T)
-                features_data = GET_FEATURES[features](x, sr, params)
-                
-                hop_length = 160 # hop_length smaller, seq_len larger
-                mfcc = librosa.feature.mfcc(y=x, sr=sr, n_mfcc=40, hop_length=hop_length, htk=True).T # (seq_len, 20)
-                
-                # Segment features into (N,C,F,T)
-                features_segmented = segment_nd_features(x, mfcc, features_data, emotion, params['segment_size'])
+def extract_features(speaker_files: Dict[str, List[Tuple[str, int]]], 
+                    feature_type: str, 
+                    params: Dict) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Extract audio features for all speakers.
+    
+    Args:
+        speaker_files: Dictionary mapping speaker IDs to list of (file_path, emotion_label) tuples
+        feature_type: Type of features to extract ('logspec', 'logmelspec', 'logdeltaspec')
+        params: Feature extraction parameters
+        
+    Returns:
+        Dictionary mapping speaker IDs to their extracted features
+    """
+    if feature_type not in FEATURE_EXTRACTORS:
+        raise ValueError(f"Unsupported feature type: {feature_type}")
+        
+    processor = get_wav2vec_processor()
+    speaker_features = defaultdict(dict)
+    
+    for speaker_id in tqdm(speaker_files.keys(), desc="Processing speakers"):
+        features_data = _extract_speaker_features(
+            speaker_files[speaker_id], feature_type, params, processor
+        )
+        
+        if features_data:
+            speaker_features[speaker_id] = features_data
+            _print_speaker_stats(speaker_id, features_data)
+    
+    assert len(speaker_features) == len(speaker_files), \
+        "Mismatch between input and output speaker count"
+    
+    return dict(speaker_features)
 
-                #Collect all the segments
-                data_tot.append(features_segmented[1])
-                labels_tot.append(features_segmented[3])
-                labels_segs_tot.extend(features_segmented[2])
-                segs.append(features_segmented[0])
-                data_mfcc.append(features_segmented[4])
-                data_audio.append(features_segmented[5])
-                
-            except Exception as e:
-                print(f"Error processing file {wav_path}: {str(e)}")
-                continue
 
-        # 检查是否有有效的数据
-        if len(data_tot) == 0:
-            print(f"Warning: No valid data for speaker {speaker_id}")
+def _extract_speaker_features(file_list: List[Tuple[str, int]], 
+                             feature_type: str, 
+                             params: Dict,
+                             processor: Optional[Wav2Vec2Processor]) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Extract features for a single speaker.
+    
+    Args:
+        file_list: List of (file_path, emotion_label) tuples for the speaker
+        feature_type: Type of features to extract
+        params: Feature extraction parameters
+        processor: Wav2Vec2 processor instance
+        
+    Returns:
+        Dictionary containing extracted features or None if no valid data
+    """
+    data_collections = {
+        'spectrograms': [],
+        'utterance_labels': [],
+        'segment_labels': [],
+        'segment_counts': [],
+        'mfcc_features': [],
+        'audio_features': []
+    }
+    
+    for wav_path, emotion_label in file_list:
+        if not validate_audio_file(wav_path):
             continue
             
-        # Post process
-        data_tot = np.vstack(data_tot).astype(np.float32)
-        data_mfcc = np.vstack(data_mfcc).astype(np.float32)
-        data_audio = np.vstack(data_audio).astype(np.float32)
-        labels_tot = np.asarray(labels_tot, dtype=np.int64)
-        labels_segs_tot = np.asarray(labels_segs_tot, dtype=np.int64)
-        segs = np.asarray(segs, dtype=np.int64)
-        
-        # Make sure everything is extracted properly
-        assert len(labels_tot) == len(segs)
-        assert data_tot.shape[0] == labels_segs_tot.shape[0] == sum(segs)
+        audio_data, sample_rate = load_and_preprocess_audio(wav_path)
+        if audio_data is None:
+            continue
+            
+        try:
+            # Extract spectral features
+            spectral_features = FEATURE_EXTRACTORS[feature_type](audio_data, sample_rate, params)
+            
+            # Extract MFCC features
+            mfcc_features = librosa.feature.mfcc(
+                y=audio_data, 
+                sr=sample_rate, 
+                n_mfcc=DEFAULT_MFCC_FEATURES, 
+                hop_length=DEFAULT_HOP_LENGTH, 
+                htk=True
+            ).T
+            
+            # Segment features
+            segmented_data = segment_features(
+                audio_data, mfcc_features, spectral_features, 
+                emotion_label, params['segment_size'], processor
+            )
+            
+            # Collect segmented data
+            _collect_segmented_data(data_collections, segmented_data)
+            
+        except Exception as e:
+            print(f"Error processing file {wav_path}: {str(e)}")
+            continue
+    
+    return _finalize_speaker_features(data_collections)
 
-        #Put into speaker features dictionary
-        print(f"Speaker {speaker_id}:")
-        print(f"  Complete shape: {data_tot.shape}")  # 显示完整shape
-        print(f"  Segments shape: {labels_segs_tot.shape}")
-        print(f"  Audio shape: {data_audio.shape}")
-        print(f"  Labels shape: {labels_tot.shape}")
-        print(f"  Segs shape: {segs.shape}")
-        
-        audio_features = defaultdict()
-        audio_features["seg_spec"] = data_tot
-        audio_features["utter_label"] = labels_tot
-        audio_features["seg_label"] = labels_segs_tot
-        audio_features["seg_num"] = segs
-        audio_features["seg_mfcc"] = data_mfcc
-        audio_features["seg_audio"] = data_audio
-        speaker_features[speaker_id] = audio_features
 
-    assert len(speaker_features) == len (speaker_files)
-
-    return speaker_features
-
-def padding(feature, MAX_LEN):
+def _collect_segmented_data(collections: Dict[str, List], 
+                           segmented_data: Tuple) -> None:
     """
-    mode: 
-        zero: padding with 0
-        normal: padding with normal distribution
-    location: front / back
+    Collect segmented data into collections.
+    
+    Args:
+        collections: Dictionary of data collections
+        segmented_data: Tuple containing segmented features
     """
-    padding_mode  = 'zeros'
-    padding_location = 'back'
+    num_segments, spectrograms, segment_labels, utterance_label, mfcc_data, audio_data = segmented_data
+    
+    collections['spectrograms'].append(spectrograms)
+    collections['utterance_labels'].append(utterance_label)
+    collections['segment_labels'].extend(segment_labels)
+    collections['segment_counts'].append(num_segments)
+    collections['mfcc_features'].append(mfcc_data)
+    collections['audio_features'].append(audio_data)
 
+
+def _finalize_speaker_features(collections: Dict[str, List]) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Finalize and validate speaker features.
+    
+    Args:
+        collections: Dictionary of collected data
+        
+    Returns:
+        Dictionary of finalized features or None if no valid data
+    """
+    if len(collections['spectrograms']) == 0:
+        return None
+    
+    # Stack and convert data types
+    try:
+        spectrograms = np.vstack(collections['spectrograms']).astype(np.float32)
+        mfcc_features = np.vstack(collections['mfcc_features']).astype(np.float32)
+        audio_features = np.vstack(collections['audio_features']).astype(np.float32)
+        utterance_labels = np.asarray(collections['utterance_labels'], dtype=np.int64)
+        segment_labels = np.asarray(collections['segment_labels'], dtype=np.int64)
+        segment_counts = np.asarray(collections['segment_counts'], dtype=np.int64)
+        
+        # Validate data consistency
+        assert len(utterance_labels) == len(segment_counts), \
+            "Mismatch between utterance labels and segment counts"
+        assert spectrograms.shape[0] == segment_labels.shape[0] == sum(segment_counts), \
+            "Mismatch between spectrograms and segment labels"
+        
+        return {
+            "seg_spec": spectrograms,
+            "utter_label": utterance_labels,
+            "seg_label": segment_labels,
+            "seg_num": segment_counts,
+            "seg_mfcc": mfcc_features,
+            "seg_audio": audio_features
+        }
+        
+    except Exception as e:
+        print(f"Error finalizing speaker features: {e}")
+        return None
+
+
+def _print_speaker_stats(speaker_id: str, features_data: Dict[str, np.ndarray]) -> None:
+    """
+    Print statistics for speaker features.
+    
+    Args:
+        speaker_id: Speaker identifier
+        features_data: Dictionary containing speaker features
+    """
+    print(f"Speaker {speaker_id}:")
+    print(f"  Spectrograms shape: {features_data['seg_spec'].shape}")
+    print(f"  Segments shape: {features_data['seg_label'].shape}")
+    print(f"  Audio shape: {features_data['seg_audio'].shape}")
+    print(f"  Utterance labels shape: {features_data['utter_label'].shape}")
+    print(f"  Segment counts shape: {features_data['seg_num'].shape}")
+
+
+def apply_padding(feature: np.ndarray, 
+                 max_length: int, 
+                 padding_mode: str = 'zeros', 
+                 padding_location: str = 'back') -> np.ndarray:
+    """
+    Apply padding to feature array.
+    
+    Args:
+        feature: Input feature array
+        max_length: Maximum length after padding
+        padding_mode: 'zeros' or 'normal' distribution padding
+        padding_location: 'front' or 'back' padding location
+        
+    Returns:
+        Padded feature array
+    """
     length = feature.shape[0]
-    if length >= MAX_LEN:
-        return feature[:MAX_LEN, :]
-        
+    if length >= max_length:
+        return feature[:max_length, :]
+    
+    pad_length = max_length - length
+    feature_dim = feature.shape[-1]
+    
     if padding_mode == "zeros":
-        pad = np.zeros([MAX_LEN - length, feature.shape[-1]])
+        pad = np.zeros([pad_length, feature_dim])
     elif padding_mode == "normal":
         mean, std = feature.mean(), feature.std()
-        pad = np.random.normal(mean, std, (MAX_LEN-length, feature.shape[1]))
+        pad = np.random.normal(mean, std, (pad_length, feature_dim))
+    else:
+        raise ValueError(f"Unsupported padding mode: {padding_mode}")
+    
+    if padding_location == "front":
+        return np.concatenate([pad, feature], axis=0)
+    else:
+        return np.concatenate([feature, pad], axis=0)
 
-    feature = np.concatenate([pad, feature], axis=0) if(padding_location == "front") else \
-              np.concatenate((feature, pad), axis=0)
-    return feature
-                  
-def paddingSequence(sequences):
+
+def pad_sequences(sequences: List[np.ndarray]) -> np.ndarray:
+    """
+    Pad sequences to uniform length.
+    
+    Args:
+        sequences: List of feature sequences
+        
+    Returns:
+        Padded sequences array
+    """
     if len(sequences) == 0:
-        return sequences
+        return np.array(sequences)
+    
     feature_dim = sequences[0].shape[-1]
-    lens = [s.shape[0] for s in sequences]
-    # confirm length using (mean + std)
-    final_length = int(np.mean(lens) + 3 * np.std(lens))
-    # padding sequences to final_length
-    final_sequence = np.zeros([len(sequences), final_length, feature_dim])
-    for i, s in enumerate(sequences):
-        final_sequence[i] = padding(s, final_length)
+    lengths = [s.shape[0] for s in sequences]
+    
+    # Calculate final length using mean + 3*std
+    final_length = int(np.mean(lengths) + 3 * np.std(lengths))
+    
+    # Pad sequences to final length
+    padded_sequences = np.zeros([len(sequences), final_length, feature_dim])
+    for i, sequence in enumerate(sequences):
+        padded_sequences[i] = apply_padding(sequence, final_length)
+    
+    return padded_sequences
 
-    return final_sequence
+
+def extract_log_spectrogram(audio: np.ndarray, 
+                           sample_rate: int, 
+                           params: Dict) -> np.ndarray:
+    """
+    Extract log spectrogram features.
+    
+    Args:
+        audio: Audio signal
+        sample_rate: Sampling rate
+        params: Feature extraction parameters
         
-def extract_logspec(x, sr, params):
+    Returns:
+        Log spectrogram with shape (C, F, T) where C=1
+    """
+    # Extract parameters
+    window = params['window']
+    win_length = int((params['win_length'] / 1000) * sample_rate)
+    hop_length = int((params['hop_length'] / 1000) * sample_rate)
+    n_fft = params['ndft']
+    n_freq = params['nfreq']
     
-    #unpack params
-    window        = params['window']
-    win_length    = int((params['win_length']/1000) * sr)
-    hop_length    = int((params['hop_length']/1000) * sr)
-    ndft          = params['ndft']
-    nfreq         = params['nfreq']
-
-    #calculate stft
-    spec = np.abs(librosa.stft(x, n_fft=ndft,hop_length=hop_length,
-                                        win_length=win_length,
-                                        window=window))
+    # Calculate STFT
+    spectrogram = np.abs(librosa.stft(
+        audio, 
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window
+    ))
     
-    spec =  librosa.amplitude_to_db(spec, ref=np.max)
+    # Convert to log scale
+    log_spec = librosa.amplitude_to_db(spectrogram, ref=np.max)
     
-    #extract the required frequency bins
-    spec = spec[:nfreq]
+    # Extract required frequency bins
+    log_spec = log_spec[:n_freq]
     
-    #Shape into (C, F, T), C = 1
-    spec = np.expand_dims(spec,0)
-
-    return spec
+    # Shape to (C, F, T) with C=1
+    return np.expand_dims(log_spec, 0)
 
 
-
-
-def extract_logmelspec(x, sr, params):
- 
-    #unpack params
-    window        = params['window']
-    win_length    = int((params['win_length']/1000) * sr)
-    hop_length    = int((params['hop_length']/1000) * sr)
-    ndft          = params['ndft']
-    n_mels        = params['nmel']
+def extract_log_mel_spectrogram(audio: np.ndarray, 
+                               sample_rate: int, 
+                               params: Dict) -> np.ndarray:
+    """
+    Extract log mel spectrogram features.
     
-
-    #calculate stft
-    melspec = librosa.feature.melspectrogram(y=x, sr=sr, n_mels=n_mels,
-                                        n_fft=ndft,hop_length=hop_length,
-                                        win_length=win_length,
-                                        window=window)
-    
-    logmelspec =  librosa.power_to_db(melspec, ref=np.max)
-
-    # Expand to (C, F, T), C = 3
-    logmelspec =  np.expand_dims(logmelspec, 0)
-    
-    return logmelspec
-
-
-
-
-def extract_logdeltaspec(x, sr, params):
-      
-    #unpack params
-    window        = params['window']
-    win_length    = int((params['win_length']/1000) * sr)
-    hop_length    = int((params['hop_length']/1000) * sr)
-    ndft          = params['ndft']
-    n_freq        = params['nfreq']
-    
-    #calculate stft
-    logspec = extract_logspec(x, sr, params) # (C, F, T)
-
-    logdeltaspec = librosa.feature.delta(logspec.squeeze(0))
-    logdelta2spec = librosa.feature.delta(logspec.squeeze(0), order=2)
-    
-    #Arrange into (C, F, T), C = 3
-    logdeltaspec = np.expand_dims(logdeltaspec, axis=0)
-    logdelta2spec = np.expand_dims(logdelta2spec, axis=0)
-    logspec = np.concatenate((logspec, logdeltaspec, logdelta2spec), axis=0)
-    
-    return logspec
-
-
-def segment_nd_features(input_values, mfcc, data, emotion, segment_size):
-    '''
-    Segment features into <segment_size> frames.
-    Pad with 0 if data frames < segment_size
-
-    Input:
-    ------
-        - data: shape is (Channels, Fime, Time)
-        - emotion: emotion label for the current utterance data
-        - segment_size: length of each segment
-    
-    Return:
-    -------
-    Tuples of (number of segments, frames, segment labels, utterance label)
-        - frames: ndarray of shape (N, C, F, T)
-                    - N: number of segments
-                    - C: number of channels
-                    - F: frequency index
-                    - T: time index
-        - segment labels: list of labels for each segments
-                    - len(segment labels) == number of segments
-    '''
-    segment_size_wav = segment_size * 160
-    # Transpose data to C, T, F
-    
-    data = data.transpose(0,2,1)
-    time = data.shape[1]
-    time_wav = input_values.shape[0]
-    nch = data.shape[0]
-    start, end = 0, segment_size
-    start_wav, end_wav = 0, segment_size_wav
-    num_segs = math.ceil(time / segment_size) # number of segments of each utterance
-    #if num_segs > 1:
-    #    num_segs = num_segs - 1
-    mfcc_tot = []
-    audio_tot = []
-    data_tot = []
-    sf = 0
-    
-    processor = Wav2Vec2Processor.from_pretrained("E:\\code\\Trae\\CNN_GRU_SeqCap\\pretrain_model\\wav2vec2-base-960h")
-    
-    for i in range(num_segs):
-        # The last segment
-        if end > time:
-            end = time
-            start = max(0, end - segment_size)
-        if end_wav > time_wav:
-            end_wav = time_wav
-            start_wav = max(0, end_wav - segment_size_wav)
-        """
-        if end-start < 100:
-            num_segs -= 1
-            print('truncated')
-            break
-        """
-        # Do padding
-        mfcc_pad = np.pad(
-                mfcc[start:end], ((0, segment_size - (end - start)), (0, 0)), mode="constant")
+    Args:
+        audio: Audio signal
+        sample_rate: Sampling rate
+        params: Feature extraction parameters
         
-        audio_pad = np.pad(input_values[start_wav:end_wav], ((segment_size_wav - (end_wav - start_wav)), (0)), mode="constant")
-  
-        data_pad = []
-        for c in range(nch):
-            data_ch = data[c]
-            data_ch = np.pad(
-                data_ch[start:end], ((0, segment_size - (end - start)), (0, 0)), mode="constant")
-                #data_ch[start:end], ((0, segment_size - (end - start)), (0, 0)), mode="constant",
-                #constant_values=((-80,-80),(-80,-80)))
-            data_pad.append(data_ch)
-
-        
-        #audio_wav = processor(audio_wav.cpu(), sampling_rate=16000, return_tensors="pt").input_values# [1, batch, 48000] 
-        #audio_wav = audio_wav.permute(1, 2, 0) # [batch, 48000, 1] 
-        #audio_wav = audio_wav.reshape(audio_wav.shape[0],-1) # [batch, 48000] 
-        
-        
-        data_pad = np.array(data_pad)
-        
-        # Stack
-        mfcc_tot.append(mfcc_pad)
-        data_tot.append(data_pad)
-
-        audio_pad_np = np.array(audio_pad)
-        audio_pad_pt = processor(audio_pad_np, sampling_rate=16000, return_tensors="pt").input_values
-        audio_pad_pt = audio_pad_pt.view(-1)
-        audio_pad_pt_np = audio_pad_pt.cpu().detach().numpy()
-        audio_tot.append(audio_pad_pt_np)
-        
-        # Update variables
-        start = end
-        end = min(time, end + segment_size)
-        start_wav = end_wav
-        end_wav = min(time_wav, end_wav + segment_size_wav)      
+    Returns:
+        Log mel spectrogram with shape (C, F, T) where C=1
+    """
+    # Extract parameters
+    window = params['window']
+    win_length = int((params['win_length'] / 1000) * sample_rate)
+    hop_length = int((params['hop_length'] / 1000) * sample_rate)
+    n_fft = params['ndft']
+    n_mels = params['nmel']
     
-    mfcc_tot = np.stack(mfcc_tot)
-    data_tot = np.stack(data_tot)
-    audio_tot = np.stack(audio_tot)
-    utt_label = emotion
-    segment_labels = [emotion] * num_segs
+    # Calculate mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio, 
+        sr=sample_rate, 
+        n_mels=n_mels,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window
+    )
     
-    #Transpose output to N,C,F,T
-    data_tot = data_tot.transpose(0,1,3,2)
+    # Convert to log scale
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    
+    # Shape to (C, F, T) with C=1
+    return np.expand_dims(log_mel_spec, 0)
 
-    return (num_segs, data_tot, segment_labels, utt_label, mfcc_tot, audio_tot)
 
-#Feature extraction function map
-GET_FEATURES = {'logspec': extract_logspec,
-                'logmelspec': extract_logmelspec,
-                'logdeltaspec': extract_logdeltaspec
-                }
+def extract_log_delta_spectrogram(audio: np.ndarray, 
+                                 sample_rate: int, 
+                                 params: Dict) -> np.ndarray:
+    """
+    Extract log delta spectrogram features (original + delta + delta-delta).
+    
+    Args:
+        audio: Audio signal
+        sample_rate: Sampling rate
+        params: Feature extraction parameters
+        
+    Returns:
+        Log delta spectrogram with shape (C, F, T) where C=3
+    """
+    # Get base log spectrogram
+    log_spec = extract_log_spectrogram(audio, sample_rate, params)  # (1, F, T)
+    
+    # Calculate delta and delta-delta features
+    base_spec = log_spec.squeeze(0)  # (F, T)
+    delta_spec = librosa.feature.delta(base_spec)
+    delta2_spec = librosa.feature.delta(base_spec, order=2)
+    
+    # Combine into (C, F, T) with C=3
+    delta_spec = np.expand_dims(delta_spec, axis=0)
+    delta2_spec = np.expand_dims(delta2_spec, axis=0)
+    
+    return np.concatenate([log_spec, delta_spec, delta2_spec], axis=0)
 
-if __name__ == '__main__':
-    #test
-    sig,sr = librosa.load('noise_wav/presto.wav', sr=None)
 
-    params={'window': 'hamming',
-            'win_length': 40,
-            'hop_length': 10,
-            'ndft':800,
-            'nfreq':200}
-    logdeltaspec = extract_logdeltaspec(sig[5000:37000], sr, params)
-    data = segment_nd_features(sig[5000:37000], None, logdeltaspec, 0, 300)  
-    segment = data[1]
-    segment = np.squeeze(segment)
-    segment = np.squeeze(segment)
-    print(segment.shape)
-    plt.figure()
-    plt.subplot(3,1,1)
-    librosa.display.specshow(segment[0])
-    plt.subplot(3,1,2)
-    librosa.display.specshow(segment[1])
-    plt.subplot(3,1,3)
-    librosa.display.specshow(segment[2])
-    plt.show()
+def segment_features(audio_data: np.ndarray,
+                    mfcc_features: np.ndarray,
+                    spectral_features: np.ndarray,
+                    emotion_label: int,
+                    segment_size: int,
+                    processor: Optional[Wav2Vec2Processor] = None) -> Tuple:
+    """
+    Segment features into fixed-size frames with padding.
+    
+    Args:
+        audio_data: Raw audio signal
+        mfcc_features: MFCC features with shape (T, F)
+        spectral_features: Spectral features with shape (C, F, T)
+        emotion_label: Emotion label for the utterance
+        segment_size: Size of each segment in frames
+        processor: Wav2Vec2 processor for audio processing
+        
+    Returns:
+        Tuple of (num_segments, segmented_spectral, segment_labels, 
+                 utterance_label, segmented_mfcc, segmented_audio)
+    """
+    segment_size_audio = segment_size * SEGMENT_SIZE_MULTIPLIER
+    
+    # Transpose spectral features to (C, T, F)
+    spectral_features = spectral_features.transpose(0, 2, 1)
+    
+    time_frames = spectral_features.shape[1]
+    time_audio = audio_data.shape[0]
+    num_channels = spectral_features.shape[0]
+    
+    # Calculate number of segments
+    num_segments = math.ceil(time_frames / segment_size)
+    
+    # Initialize collections
+    segmented_mfcc = []
+    segmented_audio = []
+    segmented_spectral = []
+    
+    # Process each segment
+    for i in range(num_segments):
+        # Calculate segment boundaries
+        start_frame = i * segment_size
+        end_frame = min(start_frame + segment_size, time_frames)
+        
+        start_audio = i * segment_size_audio
+        end_audio = min(start_audio + segment_size_audio, time_audio)
+        
+        # Handle last segment
+        if end_frame == time_frames and end_frame - start_frame < segment_size:
+            start_frame = max(0, end_frame - segment_size)
+        if end_audio == time_audio and end_audio - start_audio < segment_size_audio:
+            start_audio = max(0, end_audio - segment_size_audio)
+        
+        # Pad MFCC features
+        mfcc_segment = mfcc_features[start_frame:end_frame]
+        mfcc_padded = np.pad(
+            mfcc_segment, 
+            ((0, segment_size - (end_frame - start_frame)), (0, 0)), 
+            mode="constant"
+        )
+        segmented_mfcc.append(mfcc_padded)
+        
+        # Pad audio data
+        audio_segment = audio_data[start_audio:end_audio]
+        audio_padded = np.pad(
+            audio_segment,
+            (segment_size_audio - (end_audio - start_audio), 0),
+            mode="constant"
+        )
+        
+        # Process with Wav2Vec2 if available
+        if processor is not None:
+            try:
+                audio_processed = processor(
+                    audio_padded, 
+                    sampling_rate=DEFAULT_SAMPLING_RATE, 
+                    return_tensors="pt"
+                ).input_values
+                audio_processed = audio_processed.view(-1).cpu().detach().numpy()
+                segmented_audio.append(audio_processed)
+            except Exception as e:
+                print(f"Warning: Wav2Vec2 processing failed: {e}")
+                segmented_audio.append(audio_padded)
+        else:
+            segmented_audio.append(audio_padded)
+        
+        # Pad spectral features
+        spectral_segment = []
+        for c in range(num_channels):
+            channel_data = spectral_features[c, start_frame:end_frame]
+            channel_padded = np.pad(
+                channel_data,
+                ((0, segment_size - (end_frame - start_frame)), (0, 0)),
+                mode="constant"
+            )
+            spectral_segment.append(channel_padded)
+        
+        segmented_spectral.append(np.array(spectral_segment))
+    
+    # Stack all segments
+    segmented_mfcc = np.stack(segmented_mfcc)
+    segmented_spectral = np.stack(segmented_spectral)
+    segmented_audio = np.stack(segmented_audio)
+    
+    # Create segment labels
+    segment_labels = [emotion_label] * num_segments
+    
+    # Transpose spectral output to (N, C, F, T)
+    segmented_spectral = segmented_spectral.transpose(0, 1, 3, 2)
+    
+    return (num_segments, segmented_spectral, segment_labels, 
+            emotion_label, segmented_mfcc, segmented_audio)
+
+
+# Feature extraction function mapping
+FEATURE_EXTRACTORS = {
+    'logspec': extract_log_spectrogram,
+    'logmelspec': extract_log_mel_spectrogram,
+    'logdeltaspec': extract_log_delta_spectrogram
+}
+
+

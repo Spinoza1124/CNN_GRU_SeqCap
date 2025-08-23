@@ -1,6 +1,6 @@
 dataset: 'IEMOCAP'
 
-dataset_dir: 'E:\\code\\Trae\\CNN_GRU_SeqCap\\data\\IEMOCAP'
+dataset_dir: '/mnt/shareEEx/liuyang/code/CNN_GRU_SeqCap/data/IEMOCAP'
 
 features: 'logspec'
 
@@ -25,7 +25,7 @@ segment_size: 300
 # Set this flag to mix with noise.
 mixnoise: True
 
-save_dir: "E:\\code\\Trae\\CNN_GRU_SeqCap\\data"
+save_dir: "/mnt/shareEEx/liuyang/code/CNN_GRU_SeqCap/data"
 
 save_label: 'multi345'
 

@@ -20,6 +20,219 @@ except ImportError:
 from collections import defaultdict
 
 from model.CNN_GRU_SeqCap import CNN_GRU_SeqCap
+import gc
+
+class GPUManager:
+    """
+    GPU检测和管理类
+    提供GPU型号检测、选择、验证和错误处理功能
+    """
+    
+    def __init__(self):
+        self.available_gpus = []
+        self.gpu_info = {}
+        self.detect_gpus()
+    
+    def detect_gpus(self):
+        """检测系统中可用的GPU设备"""
+        self.available_gpus = []
+        self.gpu_info = {}
+        
+        # 添加CPU选项
+        self.available_gpus.append("cpu")
+        self.gpu_info["cpu"] = {
+            "name": "CPU (Central Processing Unit)",
+            "memory": "System RAM",
+            "device_id": "cpu"
+        }
+        
+        # 检测CUDA GPU
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            for i in range(gpu_count):
+                try:
+                    gpu_name = torch.cuda.get_device_name(i)
+                    gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
+                    
+                    device_key = f"cuda:{i}"
+                    self.available_gpus.append(device_key)
+                    self.gpu_info[device_key] = {
+                        "name": gpu_name,
+                        "memory": f"{gpu_memory:.1f} GB",
+                        "device_id": device_key,
+                        "gpu_id": i
+                    }
+                except Exception as e:
+                    print(f"⚠️  Error detecting GPU {i}: {e}")
+        
+        return self.available_gpus
+    
+    def list_available_gpus(self):
+        """列出所有可用的GPU设备信息"""
+        print("\n" + "="*60)
+        print("🔍 Available GPU Devices:")
+        print("="*60)
+        
+        for i, gpu_key in enumerate(self.available_gpus):
+            if gpu_key in self.gpu_info:
+                info = self.gpu_info[gpu_key]
+                status = "✅ Available"
+                
+                # 验证GPU可用性
+                if gpu_key != "cpu":
+                    is_available, _ = self.validate_gpu_availability(gpu_key)
+                    status = "✅ Available" if is_available else "❌ Unavailable"
+                
+                print(f"  [{i}] {gpu_key}:")
+                print(f"      Name: {info['name']}")
+                print(f"      Memory: {info['memory']}")
+                print(f"      Status: {status}")
+                print()
+        
+        print("="*60)
+    
+    def validate_gpu_availability(self, gpu_key):
+        """验证指定GPU是否可用"""
+        if gpu_key == "cpu":
+            return True, "CPU is always available"
+        
+        if gpu_key.startswith("cuda:"):
+            try:
+                gpu_id = int(gpu_key.split(":")[1])
+                if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+                    # 测试GPU访问性
+                    device = torch.device(gpu_key)
+                    test_tensor = torch.tensor([1.0]).to(device)
+                    del test_tensor  # 清理测试张量
+                    torch.cuda.empty_cache()  # 清理GPU缓存
+                    return True, f"GPU {gpu_id} is available and accessible"
+                else:
+                    return False, f"GPU {gpu_id} is not available or CUDA is not accessible"
+            except Exception as e:
+                return False, f"Error accessing GPU {gpu_key}: {str(e)}"
+        
+        return False, f"Unknown device: {gpu_key}"
+    
+    def get_device_by_index(self, index):
+        """根据索引获取设备"""
+        if 0 <= index < len(self.available_gpus):
+            return self.available_gpus[index]
+        return None
+    
+    def get_device_info(self, gpu_key):
+        """获取设备详细信息"""
+        return self.gpu_info.get(gpu_key, None)
+    
+    def select_best_gpu(self):
+        """自动选择最佳GPU（内存最大的可用GPU）"""
+        best_gpu = "cpu"
+        max_memory = 0
+        
+        for gpu_key in self.available_gpus:
+            if gpu_key == "cpu":
+                continue
+                
+            is_available, _ = self.validate_gpu_availability(gpu_key)
+            if is_available and gpu_key in self.gpu_info:
+                try:
+                    gpu_id = int(gpu_key.split(":")[1])
+                    memory = torch.cuda.get_device_properties(gpu_id).total_memory
+                    if memory > max_memory:
+                        max_memory = memory
+                        best_gpu = gpu_key
+                except:
+                    continue
+        
+        return best_gpu
+
+def setup_device_with_gpu_selection(args, gpu_manager):
+    """
+    根据用户选择和参数设置计算设备
+    支持交互式GPU选择和自动选择
+    """
+    device = None
+    
+    # 如果用户指定了特定GPU
+    if hasattr(args, 'gpu_id') and args.gpu_id is not None:
+        if args.gpu_id == -1:  # -1 表示CPU
+            device = torch.device('cpu')
+            print(f"🖥️  Using device: {device} (user specified)")
+        else:
+            gpu_key = f"cuda:{args.gpu_id}"
+            is_available, message = gpu_manager.validate_gpu_availability(gpu_key)
+            if is_available:
+                device = torch.device(gpu_key)
+                print(f"🖥️  Using device: {device} - GPU #{args.gpu_id} (user specified)")
+            else:
+                print(f"❌ Error: {message}")
+                print("🔄 Falling back to automatic device selection...")
+                device = None
+    
+    # 如果用户强制使用CPU
+    elif args.cpu_only:
+        device = torch.device('cpu')
+        print(f"🖥️  Using device: {device} (CPU-only mode specified)")
+    
+    # 交互式GPU选择模式
+    elif hasattr(args, 'interactive_gpu') and args.interactive_gpu:
+        gpu_manager.list_available_gpus()
+        
+        while True:
+            try:
+                choice = input(f"\n🎯 Please select a device [0-{len(gpu_manager.available_gpus)-1}] or 'auto' for automatic selection: ").strip().lower()
+                
+                if choice == 'auto':
+                    selected_gpu = gpu_manager.select_best_gpu()
+                    device = torch.device(selected_gpu)
+                    gpu_id = selected_gpu.split(':')[1] if ':' in selected_gpu else 'N/A'
+                    print(f"🤖 Auto-selected device: {device} - GPU #{gpu_id}")
+                    break
+                else:
+                    index = int(choice)
+                    selected_gpu = gpu_manager.get_device_by_index(index)
+                    if selected_gpu:
+                        is_available, message = gpu_manager.validate_gpu_availability(selected_gpu)
+                        if is_available:
+                            device = torch.device(selected_gpu)
+                            gpu_id = selected_gpu.split(':')[1] if ':' in selected_gpu else 'N/A'
+                            print(f"✅ Selected device: {device} - GPU #{gpu_id}")
+                            break
+                        else:
+                            print(f"❌ Error: {message}")
+                            print("Please select another device.")
+                    else:
+                        print("❌ Invalid selection. Please try again.")
+            except (ValueError, KeyboardInterrupt):
+                print("❌ Invalid input. Please enter a number or 'auto'.")
+    
+    # 自动设备选择（默认行为）
+    if device is None:
+        if torch.cuda.is_available():
+            # 自动选择最佳GPU
+            best_gpu = gpu_manager.select_best_gpu()
+            device = torch.device(best_gpu)
+            gpu_id = best_gpu.split(':')[1] if ':' in best_gpu else 'N/A'
+            print(f"🤖 Auto-selected device: {device} - GPU #{gpu_id}")
+        else:
+            device = torch.device('cpu')
+            print(f"🖥️  Using device: {device} (CUDA not available)")
+    
+    # 显示设备详细信息
+    if device.type == 'cuda':
+        gpu_info = gpu_manager.get_device_info(str(device))
+        if gpu_info:
+            print(f"📊 GPU Info: {gpu_info['name']} ({gpu_info['memory']})")
+        
+        print(f"✅ CUDA detected, using GPU accelerated training")
+        print(f"   GPU device count: {torch.cuda.device_count()}")
+        print(f"   Current GPU: {torch.cuda.get_device_name(device.index)}")
+        print(f"   GPU memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024**3:.1f} GB")
+    elif torch.cuda.is_available():
+        print("⚠️  CUDA detected but using CPU")
+    else:
+        print("⚠️  CUDA not detected, running on CPU")
+    
+    return device
 
 def xavier_init_weights(model):
     """Apply Xavier initialization to CNN and Capsule layers"""
@@ -31,6 +244,44 @@ def xavier_init_weights(model):
         elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+
+def validate_model_input(model, sample_input, device):
+    """Validate model architecture and input compatibility"""
+    print(f"\n🔍 Validating model architecture and input compatibility...")
+    print(f"   Input shape: {sample_input.shape}")
+    print(f"   Input device: {sample_input.device}")
+    print(f"   Model device: {next(model.parameters()).device}")
+    
+    try:
+        model.eval()
+        with torch.no_grad():
+            # Test forward pass with sample input
+            output = model(sample_input)
+            print(f"   ✅ Forward pass successful")
+            print(f"   Output shape: {output.shape}")
+            print(f"   Output device: {output.device}")
+            
+            # Check output dimensions
+            expected_batch_size = sample_input.shape[0]
+            if output.shape[0] != expected_batch_size:
+                raise ValueError(f"Batch size mismatch: expected {expected_batch_size}, got {output.shape[0]}")
+            
+            # Check if output is probability distribution
+            if len(output.shape) == 2:
+                prob_sum = torch.sum(output, dim=1)
+                print(f"   Probability sum range: [{prob_sum.min():.4f}, {prob_sum.max():.4f}]")
+                if not torch.allclose(prob_sum, torch.ones_like(prob_sum), atol=1e-3):
+                    print(f"   ⚠️  Warning: Output may not be properly normalized probabilities")
+            
+            print(f"   ✅ Model validation passed")
+            return True
+            
+    except Exception as e:
+        print(f"   ❌ Model validation failed: {str(e)}")
+        print(f"   Error type: {type(e).__name__}")
+        return False
+    finally:
+        model.train()  # Reset to training mode
 
 class EarlyStopping:
     """Early stopping mechanism"""
@@ -113,8 +364,87 @@ class DynamicLearningRateScheduler:
             'window_size': len(self.train_losses)
         }
 
+class MemoryManager:
+    """Memory monitoring and dynamic batch size adjustment"""
+    
+    def __init__(self, initial_batch_size=16, min_batch_size=1):
+        self.initial_batch_size = initial_batch_size
+        self.current_batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size
+        self.oom_count = 0
+        
+    def get_gpu_memory_info(self, device):
+        """Get current GPU memory usage"""
+        if device.type == 'cuda':
+            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
+            total = torch.cuda.get_device_properties(device).total_memory / 1024**3  # GB
+            return {
+                'allocated': allocated,
+                'cached': cached,
+                'total': total,
+                'free': total - allocated
+            }
+        return None
+    
+    def clear_cache(self, device):
+        """Clear GPU cache"""
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    def handle_oom(self, device):
+        """Handle out of memory error by reducing batch size"""
+        self.oom_count += 1
+        self.clear_cache(device)
+        
+        if self.current_batch_size > self.min_batch_size:
+            self.current_batch_size = max(self.min_batch_size, self.current_batch_size // 2)
+            print(f"⚠️  CUDA OOM detected! Reducing batch size to {self.current_batch_size}")
+            return True
+        else:
+            print(f"❌ Cannot reduce batch size further (current: {self.current_batch_size})")
+            return False
+    
+    def get_current_batch_size(self):
+        return self.current_batch_size
+    
+    def monitor_memory_usage(self, device, threshold_percent=85):
+        """Monitor GPU memory usage and issue warnings"""
+        if device.type == 'cuda':
+            mem_info = self.get_gpu_memory_info(device)
+            if mem_info:
+                usage_percent = (mem_info['allocated'] / mem_info['total']) * 100
+                
+                if usage_percent > threshold_percent:
+                    print(f"⚠️  High GPU memory usage: {usage_percent:.1f}% ({mem_info['allocated']:.1f}GB/{mem_info['total']:.1f}GB)")
+                    return True
+                    
+        return False
+    
+    def get_memory_stats(self, device):
+        """Get detailed memory statistics"""
+        stats = {
+            'oom_count': self.oom_count,
+            'current_batch_size': self.current_batch_size,
+            'initial_batch_size': self.initial_batch_size
+        }
+        
+        if device.type == 'cuda':
+            mem_info = self.get_gpu_memory_info(device)
+            if mem_info:
+                stats.update({
+                    'gpu_memory_allocated_gb': mem_info['allocated'],
+                    'gpu_memory_cached_gb': mem_info['cached'],
+                    'gpu_memory_total_gb': mem_info['total'],
+                    'gpu_memory_free_gb': mem_info['free'],
+                    'gpu_memory_usage_percent': (mem_info['allocated'] / mem_info['total']) * 100
+                })
+        
+        return stats
+
 class DataAugmentation:
-    """Data augmentation class"""
+    """Data augmentation for spectrograms"""
     
     def __init__(self, noise_factor=0.01, time_mask_param=10, freq_mask_param=5):
         self.noise_factor = noise_factor
@@ -169,33 +499,56 @@ class DataAugmentation:
         return spec
 
 class IEMOCAPDataset(Dataset):
-    """IEMOCAP dataset loader"""
+    """IEMOCAP dataset loader with enhanced data preprocessing"""
     def __init__(self, data_dict, transform=None):
         """
         Args:
             data_dict: Dictionary containing seg_spec, seg_label, etc.
             transform: Data transformation function
         """
-        self.seg_spec = data_dict['seg_spec']  # (N, 1, 200, 300)
+        self.seg_spec = data_dict['seg_spec']  # Expected: (N, 1, freq, time)
         self.seg_label = data_dict['seg_label']  # (N,)
         self.transform = transform
         
-        # Data preprocessing: adjust dimensions to match model input [batch, 1, freq, time]
-        # Original data is (N, 1, 200, 300), needs to be converted to (N, 1, 200, 300)
-        # Model expects input as [batch, 1, freq_bins, time_steps]
+        # Validate and preprocess data dimensions
         print(f"Original data shape: {self.seg_spec.shape}")
+        
+        # Ensure data is in correct format [N, 1, freq, time]
+        if len(self.seg_spec.shape) == 3:
+            # If shape is (N, freq, time), add channel dimension
+            self.seg_spec = np.expand_dims(self.seg_spec, axis=1)
+            print(f"Added channel dimension, new shape: {self.seg_spec.shape}")
+        elif len(self.seg_spec.shape) == 4:
+            # Shape is already (N, C, freq, time)
+            print(f"Data already has correct 4D shape: {self.seg_spec.shape}")
+        else:
+            raise ValueError(f"Unexpected data shape: {self.seg_spec.shape}")
+        
+        # Validate label format
+        if len(self.seg_label.shape) > 1:
+            self.seg_label = self.seg_label.flatten()
+            print(f"Flattened labels, new shape: {self.seg_label.shape}")
+        
+        print(f"Final data shape: {self.seg_spec.shape}")
+        print(f"Label shape: {self.seg_label.shape}")
+        print(f"Label range: [{np.min(self.seg_label)}, {np.max(self.seg_label)}]")
         
     def __len__(self):
         return len(self.seg_spec)
     
     def __getitem__(self, idx):
-        spec = self.seg_spec[idx]  # (1, 200, 300)
+        spec = self.seg_spec[idx]  # (1, freq, time) or (C, freq, time)
         label = self.seg_label[idx]
         
         # Convert to torch tensor
         spec = torch.FloatTensor(spec)
         label = torch.LongTensor([label])[0]
         
+        # Ensure spec has correct shape [1, freq, time]
+        if spec.dim() == 2:
+            spec = spec.unsqueeze(0)  # Add channel dimension
+        
+        # Apply data augmentation if provided
         if self.transform:
             spec = self.transform(spec)
             
@@ -211,7 +564,15 @@ def load_data_by_speaker(data_path):
     total_samples = 0
     
     # Check data format and process
-    if isinstance(list(data.values())[0], dict) and 'features' in list(list(data.values())[0].values())[0]:
+    first_value = list(data.values())[0]
+    if isinstance(first_value, dict):
+        # Check if it's the nested format with 'features' key
+        first_nested_value = list(first_value.values())[0]
+        has_features_key = isinstance(first_nested_value, dict) and 'features' in first_nested_value
+    else:
+        has_features_key = False
+        
+    if isinstance(first_value, dict) and has_features_key:
         # Test data format: Session1 -> {Session1_M: {features: [], labels: []}, Session1_F: {...}}
         for session_key in sorted(data.keys()):
             session_info = data[session_key]
@@ -258,22 +619,37 @@ def create_ten_fold_speaker_splits(speaker_data):
         List of 10 folds, each containing (train_data, val_data, test_data)
     """
     speakers = list(speaker_data.keys())
-    if len(speakers) != 10:
-        raise ValueError(f"IEMOCAP should have 10 speakers, but found {len(speakers)}")
+    num_speakers = len(speakers)
+    
+    if num_speakers < 3:
+        raise ValueError(f"Need at least 3 speakers for cross-validation, but found {num_speakers}")
+    
+    # For testing with fewer speakers, adjust the number of folds
+    num_folds = min(num_speakers, 10)  # Use actual number of speakers if less than 10
+    
+    if num_speakers != 10:
+        print(f"⚠️  Warning: Expected 10 speakers for IEMOCAP, but found {num_speakers}")
+        print(f"   Using {num_folds}-fold cross-validation instead")
     
     folds = []
     
-    for i, test_speaker in enumerate(speakers):
-        print(f"\n=== Creating fold {i+1} cross-validation (Leave-One-Speaker-Out) ===")
+    for i in range(num_folds):
+        test_speaker = speakers[i % num_speakers]  # Circular selection for test speaker
+        print(f"\n=== Creating fold {i+1}/{num_folds} cross-validation (Leave-One-Speaker-Out) ===")
         print(f"Test speaker: {test_speaker}")
         
-        # Get remaining 9 speakers for training and validation
+        # Get remaining speakers for training and validation
         remaining_speakers = [s for s in speakers if s != test_speaker]
         
-        # Use 8 speakers for training and 1 speaker for validation
-        # Choose validation speaker as the next speaker in the list (circular)
-        val_speaker = remaining_speakers[i % len(remaining_speakers)]
-        train_speakers = [s for s in remaining_speakers if s != val_speaker]
+        if len(remaining_speakers) >= 2:
+            # Use one speaker for validation, rest for training
+            val_speaker = remaining_speakers[i % len(remaining_speakers)]
+            train_speakers = [s for s in remaining_speakers if s != val_speaker]
+        else:
+            # If only one remaining speaker, use it for both training and validation
+            val_speaker = remaining_speakers[0]
+            train_speakers = remaining_speakers
+            print(f"   ⚠️  Warning: Using same speaker for training and validation due to limited data")
         
         print(f"Training speakers: {train_speakers}")
         print(f"Validation speaker: {val_speaker}")
@@ -321,8 +697,19 @@ def normalize_data(train_data, val_data, test_data):
     """
     # Calculate mean and standard deviation of training set
     train_spec = train_data['seg_spec']
-    mean = np.mean(train_spec, axis=(0, 2, 3), keepdims=True)  # Keep dimensions for broadcasting
-    std = np.std(train_spec, axis=(0, 2, 3), keepdims=True)
+    
+    # Check data dimensions and calculate statistics accordingly
+    if train_spec.ndim == 3:  # (samples, freq, time)
+        mean = np.mean(train_spec, axis=0, keepdims=True)  # Shape: (1, freq, time)
+        std = np.std(train_spec, axis=0, keepdims=True)
+    elif train_spec.ndim == 4:  # (samples, channels, freq, time)
+        mean = np.mean(train_spec, axis=(0, 2, 3), keepdims=True)  # Keep dimensions for broadcasting
+        std = np.std(train_spec, axis=(0, 2, 3), keepdims=True)
+    else:
+        raise ValueError(f"Unexpected data dimensions: {train_spec.shape}. Expected 3D or 4D array.")
+    
+    print(f"Data shape: {train_spec.shape}, dimensions: {train_spec.ndim}D")
+    print(f"Mean shape: {mean.shape}, Std shape: {std.shape}")
     
     # Avoid division by zero
     std = np.where(std == 0, 1, std)
@@ -408,8 +795,8 @@ def calculate_metrics(y_true, y_pred, num_classes=4):
         'confusion_matrix': cm.tolist()  # Convert to list for JSON serialization
     }
 
-def train_epoch(model, dataloader, criterion, optimizer, device, lr_scheduler=None):
-    """Train one epoch"""
+def train_epoch(model, dataloader, criterion, optimizer, device, lr_scheduler=None, memory_manager=None):
+    """Train one epoch with memory monitoring"""
     model.train()
     total_loss = 0.0
     all_preds = []
@@ -419,40 +806,63 @@ def train_epoch(model, dataloader, criterion, optimizer, device, lr_scheduler=No
     pbar = tqdm(dataloader, desc="Training", file=sys.stdout)
     
     for batch_idx, (data, target) in enumerate(pbar):
-        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
-        
-        optimizer.zero_grad()
-        
-        # Forward pass
-        output = model(data)
-        loss = criterion(output, target)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-        # Add loss to learning rate scheduler
-        if lr_scheduler is not None:
-            lr_scheduler.add_train_loss(loss.item())
-        
-        # Prediction results
-        pred = output.argmax(dim=1)
-        all_preds.extend(pred.cpu().numpy())
-        all_labels.extend(target.cpu().numpy())
-        
-        # Update progress bar display
-        current_avg_loss = total_loss / (batch_idx + 1)
-        current_lr = optimizer.param_groups[0]['lr']
-        pbar.set_postfix({
-            'Loss': f'{loss.item():.6f}',
-            'Avg_Loss': f'{current_avg_loss:.6f}',
-            'LR': f'{current_lr:.6f}'
-        })
+        try:
+            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            output = model(data)
+            loss = criterion(output, target)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # Add loss to learning rate scheduler
+            if lr_scheduler is not None:
+                lr_scheduler.add_train_loss(loss.item())
+            
+            # Prediction results
+            pred = output.argmax(dim=1)
+            all_preds.extend(pred.cpu().numpy())
+            all_labels.extend(target.cpu().numpy())
+            
+            # Update progress bar display
+            current_avg_loss = total_loss / (batch_idx + 1)
+            current_lr = optimizer.param_groups[0]['lr']
+            postfix = {
+                'Loss': f'{loss.item():.6f}',
+                'Avg_Loss': f'{current_avg_loss:.6f}',
+                'LR': f'{current_lr:.6f}'
+            }
+            
+            # Add memory info if available
+            if memory_manager and device.type == 'cuda':
+                mem_info = memory_manager.get_gpu_memory_info(device)
+                if mem_info:
+                    postfix['GPU_Mem'] = f'{mem_info["allocated"]:.1f}GB'
+            
+            pbar.set_postfix(postfix)
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() and memory_manager:
+                print(f"\n💥 CUDA OOM Error at batch {batch_idx}: {str(e)}")
+                
+                # Handle OOM by clearing cache and potentially reducing batch size
+                if memory_manager.handle_oom(device):
+                    print("🔄 Retrying with reduced memory usage...")
+                    continue
+                else:
+                    print("❌ Cannot recover from OOM error")
+                    raise e
+            else:
+                raise e
     
-    avg_loss = total_loss / len(dataloader)
-    metrics = calculate_metrics(all_labels, all_preds)
+    avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    metrics = calculate_metrics(all_labels, all_preds) if all_labels else {}
     
     return avg_loss, metrics
 
@@ -562,6 +972,16 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🖥️  Using device: {device}")
     
+    # Initialize memory manager for dynamic batch size adjustment
+    memory_manager = MemoryManager(initial_batch_size=config['batch_size'], min_batch_size=1)
+    print(f"🧠 Memory manager initialized with batch size: {memory_manager.get_current_batch_size()}")
+    
+    # Display initial GPU memory info if using CUDA
+    if device.type == 'cuda':
+        mem_info = memory_manager.get_gpu_memory_info(device)
+        if mem_info:
+            print(f"📊 Initial GPU memory: {mem_info['allocated']:.1f}GB allocated, {mem_info['free']:.1f}GB free (Total: {mem_info['total']:.1f}GB)")
+    
     # Data normalization
     train_data, val_data, test_data, normalization_params = normalize_data(train_data, val_data, test_data)
     
@@ -594,19 +1014,32 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
         torch.cuda.empty_cache()
         print(f"🔧 GPU cache cleared")
     
-    # Create model (CNN-GRU-SeqCap architecture aligned with Wu et al. paper)
+    # Create model (CNN-GRU-SeqCap architecture)
+    # Note: The model only accepts num_classes and lambda_val parameters
     model = CNN_GRU_SeqCap(
         num_classes=config['num_classes'],
-        window_size=config.get('window_size', 40),  # Wu et al. paper: 40 input steps
-        window_stride=config.get('window_stride', 20),  # Wu et al. paper: 20 step stride
-        gru_hidden_size=config.get('gru_hidden_size', 128),  # GRU hidden dimension
-        gru_num_layers=config.get('gru_num_layers', 2),  # Number of GRU layers
-        dropout_rate=config.get('dropout_rate', 0.5)  # Dropout rate
+        lambda_val=config.get('lambda_val', 0.6)  # Fusion weight between capsule and GRU branches
     ).to(device)
     
     # Apply Xavier initialization
     xavier_init_weights(model)
     print(f"✅ Applied Xavier initialization to CNN and Capsule layers")
+    
+    # Validate model with sample input
+    try:
+        # Create a sample batch for validation
+        sample_batch = next(iter(train_loader))
+        sample_input, sample_target = sample_batch
+        sample_input = sample_input.to(device)
+        
+        # Validate model architecture and input compatibility
+        validation_success = validate_model_input(model, sample_input, device)
+        if not validation_success:
+            raise RuntimeError("Model validation failed. Please check model architecture and input data format.")
+            
+    except Exception as e:
+        print(f"❌ Error during model validation: {str(e)}")
+        raise e
     
     # Define loss function and optimizer (according to user specifications)
     criterion = nn.CrossEntropyLoss()
@@ -636,8 +1069,8 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
     for epoch in epoch_pbar:
         epoch_start_time = time.time()
         
-        # Training
-        train_loss, train_metric = train_epoch(model, train_loader, criterion, optimizer, device, lr_scheduler)
+        # Training with memory monitoring
+        train_loss, train_metric = train_epoch(model, train_loader, criterion, optimizer, device, lr_scheduler, memory_manager)
         train_losses.append(train_loss)
         train_metrics.append(train_metric)
         
@@ -697,6 +1130,9 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
     
     training_time = time.time() - start_time
     
+    # Get final memory statistics
+    final_memory_stats = memory_manager.get_memory_stats(device)
+    
     # GPU memory cleanup
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -705,6 +1141,14 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
     print(f"   Training time: {training_time:.2f} seconds")
     print(f"   Best validation WA: {best_val_wa:.4f}")
     print(f"   Test results: UA={test_metric['UA']:.4f}, WA={test_metric['WA']:.4f}")
+    
+    # Display memory usage summary
+    if final_memory_stats['oom_count'] > 0:
+        print(f"   ⚠️  OOM events: {final_memory_stats['oom_count']}")
+        print(f"   📉 Final batch size: {final_memory_stats['current_batch_size']} (initial: {final_memory_stats['initial_batch_size']})")
+    
+    if device.type == 'cuda' and 'gpu_memory_usage_percent' in final_memory_stats:
+        print(f"   🧠 Final GPU memory usage: {final_memory_stats['gpu_memory_usage_percent']:.1f}%")
     
     # Save fold results
     fold_results = {
@@ -724,7 +1168,8 @@ def train_single_fold(fold_idx, train_data, val_data, test_data, config, experim
             'val_ua': [m['UA'] for m in val_metrics],
             'train_wa': [m['WA'] for m in train_metrics],
             'val_wa': [m['WA'] for m in val_metrics]
-        }
+        },
+        'memory_stats': final_memory_stats
     }
     
     # Save fold model and results
@@ -759,37 +1204,30 @@ def main():
     parser.add_argument('--cpu_only', action='store_true',
                         help='Force CPU training (even if GPU is available)')
     
-    # CNN-GRU-SeqCap model parameters (aligned with Wu et al. paper)
-    parser.add_argument('--window_size', type=int, default=40,
-                        help='Window size for temporal segmentation (Wu et al. paper: 40)')
-    parser.add_argument('--window_stride', type=int, default=20,
-                        help='Window stride for temporal segmentation (Wu et al. paper: 20)')
-    parser.add_argument('--gru_hidden_size', type=int, default=128,
-                        help='GRU hidden dimension (default: 128)')
-    parser.add_argument('--gru_num_layers', type=int, default=2,
-                        help='Number of GRU layers (default: 2)')
-    parser.add_argument('--dropout_rate', type=float, default=0.5,
-                        help='Dropout rate (default: 0.5)')
+    # GPU selection parameters
+    parser.add_argument('--gpu_id', type=int, default=None,
+                        help='Specific GPU ID to use (0, 1, 2, ...), -1 for CPU, None for auto-selection')
+    parser.add_argument('--interactive_gpu', action='store_true',
+                        help='Enable interactive GPU selection mode')
+    parser.add_argument('--list_gpus', action='store_true',
+                        help='List available GPU devices and exit')
+    
+    # CNN-GRU-SeqCap model parameters
+    parser.add_argument('--lambda_val', type=float, default=0.6,
+                        help='Fusion weight between capsule and GRU branches (default: 0.6)')
     
     args = parser.parse_args()
     
-    # Select device based on parameters and availability
-    if args.cpu_only:
-        device = torch.device('cpu')
-        print(f"🖥️  Using device: {device} (user specified)")
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"🖥️  Using device: {device}")
-        
-    if torch.cuda.is_available() and device.type == 'cuda':
-        print(f"✅ CUDA detected, using GPU accelerated training")
-        print(f"   GPU device count: {torch.cuda.device_count()}")
-        print(f"   Current GPU: {torch.cuda.get_device_name(0)}")
-        print(f"   GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    elif torch.cuda.is_available() and device.type == 'cpu':
-        print("⚠️  CUDA detected but user chose to run on CPU")
-    else:
-        print("⚠️  CUDA not detected, running on CPU")
+    # Handle GPU listing request
+    if args.list_gpus:
+        gpu_manager = GPUManager()
+        gpu_manager.list_available_gpus()
+        return
+    
+    # Setup device with GPU selection
+    gpu_manager = GPUManager()
+    device = setup_device_with_gpu_selection(args, gpu_manager)
+
     
     # Create experiment directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -802,6 +1240,7 @@ def main():
         'epochs': args.epochs,
         'learning_rate': args.lr,
         'num_classes': args.num_classes,
+        'lambda_val': getattr(args, 'lambda_val', 0.6),  # Fusion weight between capsule and GRU branches
         'device': str(device),
         'data_path': args.data_path,
         'timestamp': timestamp,
@@ -809,17 +1248,12 @@ def main():
         'optimizer': 'Adam(β1=0.9, β2=0.999, ε=1e-8)',
         'initialization': 'Xavier (CNN and Capsule layers)',
         'lr_schedule': 'Dynamic (first 3 epochs: 0.001, then 0.0005→0.0002→0.0001 based on 100-step avg loss)',
-        'early_stopping': 'patience=7, min_delta=0.001',
+        'early_stopping': 'patience=10, min_delta=0.001',
         'regularization': 'Cross-entropy loss',
         'model_selection': 'Best validation WA (Weighted Accuracy)',
         'validation_strategy': '10-fold leave-one-speaker-out cross-validation',
-        # CNN-GRU-SeqCap model parameters (aligned with Wu et al. paper)
-        'window_size': 40,  # Wu et al. paper: 40 input steps
-        'window_stride': 20,  # Wu et al. paper: 20 step stride
-        'gru_hidden_size': 128,  # GRU hidden dimension
-        'gru_num_layers': 2,  # Number of GRU layers
-        'dropout_rate': 0.5,  # Dropout rate
-        'model_architecture': 'CNN-GRU-SeqCap (dual-branch with CNN backbone + GRU temporal modeling)'
+        'model_architecture': 'CNN-GRU-SeqCap (dual-branch with CNN backbone + Capsule and BiGRU branches)',
+        'data_augmentation': 'Gaussian noise, time masking, frequency masking'
     }
     
     print("\n📋 Ten-Fold Leave-One-Speaker-Out Cross-Validation Configuration")
